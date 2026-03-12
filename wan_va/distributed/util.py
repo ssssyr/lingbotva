@@ -22,8 +22,10 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
 
 
 def init_distributed(world_size, local_rank, rank):
-    # if world_size > 1:
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if world_size <= 1:
+        return
     dist.init_process_group(backend="nccl",
                             init_method="env://",
                             rank=rank,

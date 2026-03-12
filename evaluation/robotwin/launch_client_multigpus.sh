@@ -1,20 +1,67 @@
 #!/bin/bash
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/../config/robotwin_client_multigpu.yaml"
 
-save_root=${1:-'./results'}
+load_config() {
+    local config_file="$1"
+    eval "$(
+        python - "$config_file" <<'PY'
+import shlex
+import sys
+import yaml
 
-# General parameters
-policy_name=ACT
-task_config=demo_clean
-train_config_name=0
-model_name=0
-seed=${3:-0}
-test_num=${4:-100}
-start_port=29556 
-num_gpus=8
+config_file = sys.argv[1]
+defaults = {
+    "save_root": "./results",
+    "task_group_id": 0,
+    "policy_name": "ACT",
+    "task_config": "demo_clean",
+    "train_config_name": 0,
+    "model_name": 0,
+    "seed": 0,
+    "test_num": 100,
+    "start_port": 29556,
+    "num_gpus": 8,
+    "video_guidance_scale": 5,
+    "action_guidance_scale": 1,
+}
+with open(config_file, "r", encoding="utf-8") as f:
+    loaded = yaml.safe_load(f) or {}
+if not isinstance(loaded, dict):
+    raise SystemExit(f"Config must be a mapping: {config_file}")
+defaults.update(loaded)
+for key, value in defaults.items():
+    print(f"{key}={shlex.quote(str(value))}")
+PY
+    )"
+}
 
-task_list_id=${2:-0}
+if [[ "${1:-}" == "--config" ]]; then
+    if [[ -z "${2:-}" ]]; then
+        echo "missing config path after --config" >&2
+        exit 1
+    fi
+    load_config "$2"
+elif [[ $# -eq 0 ]]; then
+    load_config "$DEFAULT_CONFIG_FILE"
+else
+    save_root=${1:-'./results'}
+    task_group_id=${2:-0}
+    policy_name=ACT
+    task_config=demo_clean
+    train_config_name=0
+    model_name=0
+    seed=${3:-0}
+    test_num=${4:-100}
+    start_port=29556 
+    num_gpus=8
+    video_guidance_scale=5
+    action_guidance_scale=1
+fi
+
+task_list_id=${task_group_id}
 
 task_groups=(
   "stack_bowls_three handover_block hanging_mug scan_object lift_pot put_object_cabinet stack_blocks_three place_shoe"
@@ -35,6 +82,10 @@ read -r -a task_names <<< "${task_groups[$task_list_id]}"
 
 echo "task_list_id=$task_list_id"
 printf 'task_names (%d): %s\n' "${#task_names[@]}" "${task_names[*]}"
+echo "save_root=$save_root"
+echo "test_num=$test_num"
+echo "start_port=$start_port"
+echo "num_gpus=$num_gpus"
 
 log_dir="./logs"
 mkdir -p "$log_dir"
@@ -68,8 +119,8 @@ for i in "${!task_names[@]}"; do
         --seed ${seed} \
         --policy_name ${policy_name} \
         --save_root ${save_root} \
-        --video_guidance_scale 5 \
-        --action_guidance_scale 1 \
+        --video_guidance_scale ${video_guidance_scale} \
+        --action_guidance_scale ${action_guidance_scale} \
         --test_num ${test_num} \
         --port ${port} > "$log_file" 2>&1 &
 

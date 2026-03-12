@@ -6,7 +6,8 @@ transformers==4.55.2
 accelerate
 einops
 easydict
-flash_attn
+# Optional: for faster inference/training.
+# Install manually when needed: pip install flash-attn --no-build-isolation
 numpy==1.26.4
 tqdm
 imageio[ffmpeg]
@@ -18,7 +19,7 @@ ftfy
 safetensors
 Pillow
 
-# Post-training
-lerobot==0.3.3
 scipy
-wandb
+# Post-training extras are intentionally excluded from this base file.
+# Install separately when doing post-training:
+#   pip install lerobot==0.3.3 wandb --no-deps

@@ -6,7 +6,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path("/home/syr/code/lingbot-va/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -55,6 +55,10 @@ def write_json(data: dict, fpath: Path) -> None:
     fpath.parent.mkdir(exist_ok=True, parents=True)
     with open(fpath, "w") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def outcome_video_path(base_dir: Path, succ: bool) -> Path:
+    return base_dir / ("success.mp4" if succ else "failure.mp4")
 
 def add_title_bar(img, text, font_scale=0.8, thickness=2):
     """Add a black title bar with text above the image"""
@@ -313,6 +317,9 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    if usr_args.get("render_freq") is not None:
+        args["render_freq"] = usr_args["render_freq"]
+
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
@@ -507,7 +514,18 @@ def eval_policy(task_name,
         instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
+        current_eval_video_file = None
+        raw_video_dir = None
         if TASK_ENV.eval_video_path is not None:
+            raw_video_dir = Path(TASK_ENV.eval_video_path)
+            raw_success_exists = outcome_video_path(raw_video_dir, True).exists()
+            raw_failure_exists = outcome_video_path(raw_video_dir, False).exists()
+        else:
+            raw_success_exists = False
+            raw_failure_exists = False
+
+        if TASK_ENV.eval_video_path is not None and not (raw_success_exists and raw_failure_exists):
+            current_eval_video_file = Path(TASK_ENV.eval_video_path) / f"episode{TASK_ENV.test_num}.mp4"
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -530,7 +548,7 @@ def eval_policy(task_name,
                     "libx264",
                     "-crf",
                     "23",
-                    f"{TASK_ENV.eval_video_path}/episode{TASK_ENV.test_num}.mp4",
+                    str(current_eval_video_file),
                 ],
                 stdin=subprocess.PIPE,
             )
@@ -614,17 +632,29 @@ def eval_policy(task_name,
 
         vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
         vis_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
-        out_img_file = vis_dir / video_name
-        save_comparison_video(
-            real_obs_list=full_obs_list,
-            imagined_video=None, #gen_video_list,
-            action_history=full_action_history,
-            save_path=str(out_img_file),
-            fps=15 # Suggest adjusting fps based on simulation step
-        )
-        if TASK_ENV.eval_video_path is not None:
+        if current_eval_video_file is not None:
             TASK_ENV._del_eval_video_ffmpeg()
+
+        vis_target = outcome_video_path(vis_dir, succ)
+        if vis_target.exists():
+            print(f"Skip visualization video for {'success' if succ else 'failure'}: {vis_target}")
+        else:
+            save_comparison_video(
+                real_obs_list=full_obs_list,
+                imagined_video=None, #gen_video_list,
+                action_history=full_action_history,
+                save_path=str(vis_target),
+                fps=15 # Suggest adjusting fps based on simulation step
+            )
+
+        if current_eval_video_file is not None and current_eval_video_file.exists():
+            raw_target = outcome_video_path(raw_video_dir, succ)
+            if raw_target.exists():
+                current_eval_video_file.unlink()
+                print(f"Delete duplicate raw video: {current_eval_video_file}")
+            else:
+                current_eval_video_file.replace(raw_target)
+                print(f"Keep raw video: {raw_target}")
 
         if succ:
             TASK_ENV.suc += 1
@@ -667,6 +697,7 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--render_freq", type=int, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -697,4 +728,3 @@ if __name__ == "__main__":
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
-

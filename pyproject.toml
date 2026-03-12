@@ -21,11 +21,13 @@ dependencies = [
     "tqdm",
     "imageio",
     "easydict",
-    "flash_attn",
     "numpy>=1.26.4,<2"
 ]
 
 [project.optional-dependencies]
+flashattn = [
+    "flash-attn"
+]
 dev = [
     "pytest",
     "black",
@@ -57,5 +59,4 @@ profile = "black"
 
 [tool.mypy]
 strict = true
-
 
