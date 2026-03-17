@@ -26,10 +26,12 @@ def init_distributed(world_size, local_rank, rank):
         torch.cuda.set_device(local_rank)
     if world_size <= 1:
         return
+    device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else None
     dist.init_process_group(backend="nccl",
                             init_method="env://",
                             rank=rank,
-                            world_size=world_size)
+                            world_size=world_size,
+                            device_id=device)
 
 def dist_mean(local_tensor):
     if dist.is_initialized():

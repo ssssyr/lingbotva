@@ -1,0 +1,4 @@
+interface:
+  display_name: "Daily Memory Journal"
+  short_description: "Read and maintain Codex's nightly memory journal"
+  default_prompt: "Use $daily-memory-journal to read ~/.codex/memories/important-memory.md before resuming earlier Codex work or to repair the nightly memory summary."

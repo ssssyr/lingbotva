@@ -16,6 +16,7 @@ config_file = sys.argv[1]
 defaults = {
     "save_root": "./results",
     "task_name": "adjust_bottle",
+    "start_from_task": "",
     "render_freq": 0,
     "test_num": 100,
     "policy_name": "ACT",
@@ -23,6 +24,7 @@ defaults = {
     "train_config_name": 0,
     "model_name": 0,
     "seed": 0,
+    "gpu_id": 0,
     "port": 29056,
     "video_guidance_scale": 5,
     "action_guidance_scale": 1,
@@ -49,6 +51,7 @@ elif [[ $# -eq 0 ]]; then
 else
     save_root=${1:-'./results'}
     task_name=${2:-"adjust_bottle"}
+    start_from_task=""
     render_freq=${3:-0}
     test_num=${4:-100}
     policy_name=ACT
@@ -56,6 +59,7 @@ else
     train_config_name=0
     model_name=0
     seed=0
+    gpu_id=0
     port=29056
     video_guidance_scale=5
     action_guidance_scale=1
@@ -67,7 +71,11 @@ echo "  save_root=${save_root}"
 echo "  test_num=${test_num}"
 echo "  render_freq=${render_freq}"
 echo "  task_config=${task_config}"
+echo "  gpu_id=${gpu_id}"
 echo "  port=${port}"
+if [[ -n "${start_from_task}" ]]; then
+    echo "  start_from_task=${start_from_task}"
+fi
 
 ALL_TASKS=(
   adjust_bottle
@@ -125,7 +133,8 @@ ALL_TASKS=(
 run_one_task() {
     local current_task="$1"
     echo "----------------------------------------"
-    echo "running task=${current_task} test_num=${test_num}"
+    echo "running task=${current_task} test_num=${test_num} gpu_id=${gpu_id}"
+    CUDA_VISIBLE_DEVICES=${gpu_id} \
     PYTHONWARNINGS=ignore::UserWarning \
     XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
         --overrides \
@@ -146,7 +155,23 @@ run_one_task() {
 
 if [[ "${task_name}" == "__all__" ]]; then
     echo "mode=all_tasks"
-    for current_task in "${ALL_TASKS[@]}"; do
+    start_index=0
+    if [[ -n "${start_from_task}" ]]; then
+        found=0
+        for i in "${!ALL_TASKS[@]}"; do
+            if [[ "${ALL_TASKS[$i]}" == "${start_from_task}" ]]; then
+                start_index=$i
+                found=1
+                break
+            fi
+        done
+        if [[ ${found} -eq 0 ]]; then
+            echo "start_from_task not found in ALL_TASKS: ${start_from_task}" >&2
+            exit 1
+        fi
+    fi
+    for ((i=start_index; i<${#ALL_TASKS[@]}; i++)); do
+        current_task="${ALL_TASKS[$i]}"
         run_one_task "${current_task}" || exit $?
     done
 else

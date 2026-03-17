@@ -21,6 +21,9 @@ visualization/
 results/
 results_*/
 eval_result/
+metaworld/data/
+$log_file
+LingBot_VA.egg-info/
 
 # External benchmark checkout; clone separately when needed
 RoboTwin/

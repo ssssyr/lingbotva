@@ -1,0 +1,32 @@
+launcher:
+  config_name: robotwin_train
+  ngpu: 1
+  master_port: 29531
+  log_rank: 0
+  torchft_lighthouse: http://localhost:29510
+
+paths:
+  train_model_path: /home/ct_24210860031/models/lingbot-va-base
+  dataset_path: /home/ct_24210860031/812/SYR/datasets/robotwin-clean-and-aug-lerobot
+  save_root: ./train_out/robotwin_author_1gpu
+  reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+
+logging:
+  enable_wandb: false
+  wandb_project: va_robotwin
+  wandb_team_name: ""
+  wandb_base_url: ""
+  wandb_api_key: ""
+
+training:
+  load_workers: 4
+  init_workers: 1
+  save_interval: 10000
+  gc_interval: 50
+  cfg_prob: 0.1
+  learning_rate: 1e-5
+  weight_decay: 0.1
+  warmup_steps: 10
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  num_steps: 50000

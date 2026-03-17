@@ -9,6 +9,7 @@ import os
 from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
+import time
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
@@ -47,8 +48,48 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
+    num_repo = len(repo_list)
+    num_init_worker = max(1, min(int(num_init_worker), num_repo)) if num_repo else 1
+    print(
+        f"[dataset-init] discovered {num_repo} lerobot datasets under {config.dataset_path}",
+        flush=True,
+    )
+    print(
+        f"[dataset-init] using {num_init_worker} initialization workers",
+        flush=True,
+    )
+    if num_repo == 0:
+        print("[dataset-init] no datasets found", flush=True)
+        return datasets_out_lst
+
+    if num_init_worker == 1:
+        for idx, repo_id in enumerate(repo_list, start=1):
+            t0 = time.time()
+            print(
+                f"[dataset-init] ({idx}/{num_repo}) loading {repo_id}",
+                flush=True,
+            )
+            datasets_out_lst.append(construct_func(repo_id))
+            dt = time.time() - t0
+            print(
+                f"[dataset-init] ({idx}/{num_repo}) done in {dt:.1f}s",
+                flush=True,
+            )
+    else:
+        print(
+            "[dataset-init] multiprocessing init enabled; if startup stalls, retry with "
+            "LINGBOT_VA_INIT_WORKERS=1",
+            flush=True,
+        )
+        with Pool(num_init_worker) as pool:
+            datasets_out_lst = list(
+                tqdm(
+                    pool.imap(construct_func, repo_list),
+                    total=num_repo,
+                    desc='[dataset-init]',
+                    leave=False,
+                )
+            )
                 
     return datasets_out_lst
 
@@ -71,8 +112,14 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=None,
     ):
+        if num_init_worker is None:
+            num_init_worker = getattr(
+                config,
+                "init_worker",
+                getattr(config, "load_worker", 8),
+            )
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )

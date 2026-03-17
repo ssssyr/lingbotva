@@ -35,6 +35,12 @@ CFFF_REMOTE_BASE=/your/remote/code-root ./script/cfff-sync.sh
   - Run one remote command from the local machine inside the remote project root with Conda auto-loaded.
 - `./script/cfff-sync.sh`
   - Sync the local repository to the remote project root with `rsync`.
+- `./script/cfff-job-start.sh <job-name> "<command>"`
+  - Start a long-running remote job in `tmux` and persist stdout/stderr to `logs/cfff-jobs/<job-name>/<timestamp>.log`.
+- `./script/cfff-log-show.sh [job-name] [lines]`
+  - Show the latest remote log for a job, or the latest job log overall.
+- `./script/cfff-log-follow.sh [job-name]`
+  - Follow the latest remote log interactively.
 
 By default, `cfff-run.sh` and `cfff-shell.sh` activate the remote `base` Conda environment when Conda is found in a common install path such as `~/miniconda3`, `~/anaconda3`, or `/opt/conda`.
 
@@ -73,11 +79,12 @@ CFFF_CONDA_SH=/home/ct_24210860031/miniconda3/etc/profile.d/conda.sh ./script/cf
 ./script/cfff-run.sh "bash evaluation/robotwin/launch_server.sh"
 ```
 
-5. For long-running jobs, use `tmux` on the remote side:
+5. For long-running jobs, use the logging wrapper:
 
 ```bash
-./script/cfff-run.sh "tmux new -d -s lingbot-server 'cd ~/code/lingbot-va && bash evaluation/robotwin/launch_server.sh'"
-./script/cfff-run.sh "tmux ls"
+./script/cfff-job-start.sh train "bash script/run_va_posttrain.sh"
+./script/cfff-log-show.sh train 200
+./script/cfff-log-follow.sh train
 ```
 
 6. If inspection is easier interactively, attach a remote shell:
@@ -112,3 +119,4 @@ Because `AGENTS.md` is present at the repository root, the new session should al
 - If `ssh cfff` stops working, fix SSH first before debugging the repository.
 - If the remote home directory is reset by the platform, rerun your SSH key setup and resync the repository.
 - Avoid running destructive commands on the remote instance without confirming with the user first.
+- For remote debugging, prefer log-driven runs over raw interactive commands so Codex can read the exact stderr text afterward.

@@ -1,0 +1,23 @@
+# RoboTwin Environment Docker Image
+# Based on conda environment packaged on 2026-03-16
+
+FROM continuumio/miniconda3:latest
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy the conda environment
+COPY env_packs/robotwin-20260316.tar /tmp/
+
+# Extract and install the environment
+RUN tar -xf /tmp/robotwin-20260316.tar -C /opt/conda/envs/ && \
+    rm /tmp/robotwin-20260316.tar
+
+# Set the environment path
+ENV PATH="/opt/conda/envs/robotwin/bin:$PATH"
+
+# Set working directory for the project
+WORKDIR /workspace/lingbot-va
+
+# Default command
+CMD ["/bin/bash"]

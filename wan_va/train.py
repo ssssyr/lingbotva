@@ -2,8 +2,8 @@
 import argparse
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
-import wandb
 
 import torch
 import torch.distributed as dist
@@ -50,7 +50,33 @@ import gc
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            try:
+                import wandb
+            except ImportError as exc:
+                raise RuntimeError(
+                    "enable_wandb=True requires the `wandb` package. "
+                    "Install the post-training extras or disable WandB."
+                ) from exc
+
+            missing_env = [
+                key for key in ["WANDB_TEAM_NAME"]
+                if not os.environ.get(key)
+            ]
+            if missing_env:
+                raise RuntimeError(
+                    "Missing required WandB environment variables: "
+                    + ", ".join(missing_env)
+                )
+
+            login_kwargs = {}
+            wandb_base_url = os.environ.get("WANDB_BASE_URL")
+            wandb_api_key = os.environ.get("WANDB_API_KEY")
+            if wandb_base_url:
+                login_kwargs["host"] = wandb_base_url
+            if wandb_api_key:
+                login_kwargs["key"] = wandb_api_key
+            if login_kwargs:
+                wandb.login(**login_kwargs)
             self.wandb = wandb
             self.wandb.init(
                 entity=os.environ["WANDB_TEAM_NAME"],
@@ -62,6 +88,8 @@ class Trainer:
                 # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
+        else:
+            self.wandb = None
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -299,17 +327,20 @@ class Trainer:
         input_dict = self._prepare_input_dict(batch)
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        
-        if not should_sync:
-            self.transformer.set_requires_gradient_sync(False)
-        else:
+        sync_context = nullcontext()
+        if dist.is_initialized() and not should_sync:
+            if hasattr(self.transformer, "set_requires_gradient_sync"):
+                self.transformer.set_requires_gradient_sync(False)
+            elif hasattr(self.transformer, "no_sync"):
+                sync_context = self.transformer.no_sync()
+        elif hasattr(self.transformer, "set_requires_gradient_sync"):
             self.transformer.set_requires_gradient_sync(True)
 
-        output = self.transformer(input_dict, train_mode=True)
-        latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
-
-        loss.backward()
+        with sync_context:
+            output = self.transformer(input_dict, train_mode=True)
+            latent_loss, action_loss = self.compute_loss(input_dict, output)
+            loss = latent_loss + action_loss
+            loss.backward()
 
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
         

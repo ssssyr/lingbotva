@@ -516,16 +516,17 @@ def eval_policy(task_name,
 
         current_eval_video_file = None
         raw_video_dir = None
-        if TASK_ENV.eval_video_path is not None:
-            raw_video_dir = Path(TASK_ENV.eval_video_path)
+        original_eval_video_path = TASK_ENV.eval_video_path
+        if original_eval_video_path is not None:
+            raw_video_dir = Path(original_eval_video_path)
             raw_success_exists = outcome_video_path(raw_video_dir, True).exists()
             raw_failure_exists = outcome_video_path(raw_video_dir, False).exists()
         else:
             raw_success_exists = False
             raw_failure_exists = False
 
-        if TASK_ENV.eval_video_path is not None and not (raw_success_exists and raw_failure_exists):
-            current_eval_video_file = Path(TASK_ENV.eval_video_path) / f"episode{TASK_ENV.test_num}.mp4"
+        if original_eval_video_path is not None and not (raw_success_exists and raw_failure_exists):
+            current_eval_video_file = Path(original_eval_video_path) / f"episode{TASK_ENV.test_num}.mp4"
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -553,6 +554,8 @@ def eval_policy(task_name,
                 stdin=subprocess.PIPE,
             )
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
+        else:
+            TASK_ENV.eval_video_path = None
 
         succ = False
 
@@ -655,6 +658,8 @@ def eval_policy(task_name,
             else:
                 current_eval_video_file.replace(raw_target)
                 print(f"Keep raw video: {raw_target}")
+
+        TASK_ENV.eval_video_path = original_eval_video_path
 
         if succ:
             TASK_ENV.suc += 1

@@ -18,6 +18,7 @@ matplotlib
 ftfy
 safetensors
 Pillow
+PyYAML
 
 scipy
 # Post-training extras are intentionally excluded from this base file.
