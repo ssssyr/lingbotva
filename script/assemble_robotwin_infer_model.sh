@@ -77,7 +77,7 @@ for path in "$base_model" "$transformer_dir"; do
     fi
 done
 
-for req in vae tokenizer text_encoder transformer configuration.json; do
+for req in vae tokenizer text_encoder transformer; do
     if [[ ! -e "$base_model/$req" ]]; then
         echo "base model is missing required path: $base_model/$req" >&2
         exit 1

@@ -3,6 +3,10 @@ set -euo pipefail
 
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:${LD_LIBRARY_PATH:-}
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+ROBOTWIN_ROOT=${ROBOTWIN_ROOT:-"${REPO_ROOT}/RoboTwin"}
+
 save_root=${1:-"results/results_full_3.11"}
 test_num=${2:-5}
 seed=${3:-0}
@@ -71,7 +75,7 @@ all_tasks=(
 )
 
 seed_tag=$((10000 * (1 + seed)))
-metrics_root="/home/syr/code/lingbot-va/RoboTwin/${save_root}/stseed-${seed_tag}/metrics"
+metrics_root="${ROBOTWIN_ROOT}/${save_root}/stseed-${seed_tag}/metrics"
 
 mapfile -t missing_tasks < <(
   python - "$metrics_root" "$test_num" "${all_tasks[@]}" <<'PY'

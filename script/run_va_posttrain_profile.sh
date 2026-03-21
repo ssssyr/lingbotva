@@ -64,6 +64,14 @@ def get_section(name):
 def env_override(name, value):
     return os.environ.get(name, value)
 
+def optional_env_override(name, value=None):
+    env_value = os.environ.get(name)
+    if env_value is not None:
+        return env_value
+    if value in (None, ""):
+        return None
+    return value
+
 launcher = get_section("launcher")
 paths = get_section("paths")
 logging = get_section("logging")
@@ -75,15 +83,16 @@ assignments = {
     "MASTER_PORT": env_override("MASTER_PORT", launcher.get("master_port", 29501)),
     "LOG_RANK": env_override("LOG_RANK", launcher.get("log_rank", 0)),
     "TORCHFT_LIGHTHOUSE": env_override("TORCHFT_LIGHTHOUSE", launcher.get("torchft_lighthouse", "http://localhost:29510")),
+    "LINGBOT_VA_FORCE_ATTN_MODE": optional_env_override("LINGBOT_VA_FORCE_ATTN_MODE", launcher.get("force_attn_mode")),
     "LINGBOT_VA_TRAIN_MODEL_PATH": env_override("LINGBOT_VA_TRAIN_MODEL_PATH", paths.get("train_model_path", "")),
     "LINGBOT_VA_DATASET_PATH": env_override("LINGBOT_VA_DATASET_PATH", paths.get("dataset_path", "")),
     "LINGBOT_VA_SAVE_ROOT": env_override("LINGBOT_VA_SAVE_ROOT", paths.get("save_root", "./train_out")),
     "LINGBOT_VA_REFERENCE_MODEL_PATH": env_override("LINGBOT_VA_REFERENCE_MODEL_PATH", paths.get("reference_model_path", "")),
     "LINGBOT_VA_ENABLE_WANDB": env_override("LINGBOT_VA_ENABLE_WANDB", int(bool(logging.get("enable_wandb", False)))),
     "WANDB_PROJECT": env_override("WANDB_PROJECT", logging.get("wandb_project", "va_robotwin")),
-    "WANDB_TEAM_NAME": logging.get("wandb_team_name") or os.environ.get("WANDB_TEAM_NAME", ""),
-    "WANDB_BASE_URL": logging.get("wandb_base_url") or os.environ.get("WANDB_BASE_URL", ""),
-    "WANDB_API_KEY": logging.get("wandb_api_key") or os.environ.get("WANDB_API_KEY", ""),
+    "WANDB_TEAM_NAME": optional_env_override("WANDB_TEAM_NAME", logging.get("wandb_team_name")),
+    "WANDB_BASE_URL": optional_env_override("WANDB_BASE_URL", logging.get("wandb_base_url")),
+    "WANDB_API_KEY": optional_env_override("WANDB_API_KEY", logging.get("wandb_api_key")),
     "LINGBOT_VA_LOAD_WORKERS": env_override("LINGBOT_VA_LOAD_WORKERS", training.get("load_workers", 16)),
     "LINGBOT_VA_INIT_WORKERS": env_override("LINGBOT_VA_INIT_WORKERS", training.get("init_workers", 8)),
     "LINGBOT_VA_SAVE_INTERVAL": env_override("LINGBOT_VA_SAVE_INTERVAL", training.get("save_interval", 1000)),
@@ -98,6 +107,9 @@ assignments = {
 }
 
 for key, value in assignments.items():
+    if value is None:
+        print(f"unset {key}")
+        continue
     print(f"{key}={shlex.quote(str(value))}")
 PY
     )"

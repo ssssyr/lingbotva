@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import math
 import os
+import time
 from copy import deepcopy
 
 import torch
@@ -47,6 +48,14 @@ except Exception:
         flash_attn_func = None
 
 __all__ = ['WanTransformer3DModel']
+
+
+def _debug_first_step_enabled():
+    return os.environ.get("LINGBOT_VA_DEBUG_FIRST_STEP", "0") == "1" and os.environ.get("RANK", "0") == "0"
+
+
+def _debug_first_step_log(message):
+    print(f"[first-step-debug] {message}", flush=True)
 
 
 def custom_sdpa(q, k, v, attn_mask=None):
@@ -774,6 +783,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             pos_embed_seq_len=pos_embed_seq_len,
         )
         self.condition_embedder_action = deepcopy(self.condition_embedder)
+        # The action branch only reuses the time embedder path.
+        # Freezing the duplicated text embedder avoids DDP unused-parameter
+        # overhead without changing the forward pass.
+        self.condition_embedder_action.text_embedder.requires_grad_(False)
 
         self.blocks = nn.ModuleList([
             WanTransformerBlock(inner_dim,
@@ -841,6 +854,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         return temb, timestep_proj
 
     def forward_train(self, input_dict):
+        debug_first_step = _debug_first_step_enabled() and not getattr(
+            self, "_debug_first_step_done", False
+        )
+        debug_t0 = time.perf_counter()
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
@@ -863,6 +880,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                    condition_latent_hidden_states,
                                    action_hidden_states, 
                                    condition_action_hidden_states], dim=1)
+        if debug_first_step:
+            _debug_first_step_log(
+                f"input_embed_done elapsed={time.perf_counter() - debug_t0:.2f}s hidden={tuple(hidden_states.shape)}"
+            )
 
 
         latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
@@ -896,6 +917,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
         temb = F.pad(temb, (0, 0, 0, padded_length))
         timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
+        if debug_first_step:
+            _debug_first_step_log(
+                f"time_embed_done elapsed={time.perf_counter() - debug_t0:.2f}s padded_length={padded_length}"
+            )
 
         split_list = [latent_hidden_states.shape[1], 
                       condition_latent_hidden_states.shape[1], 
@@ -907,6 +932,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cross_attn_mask = None
         use_flex_attn = isinstance(self.blocks[0].attn1.attn_op, FlexAttnFunc)
         if use_flex_attn:
+            mask_t0 = time.perf_counter()
             FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
                                    action_dict['noisy_latents'].shape, 
                                    padded_length, 
@@ -915,6 +941,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                    patch_size=self.patch_size,
                                    device=hidden_states.device
                                    )
+            if debug_first_step:
+                _debug_first_step_log(
+                    f"init_mask_done elapsed={time.perf_counter() - mask_t0:.2f}s total={time.perf_counter() - debug_t0:.2f}s"
+                )
         elif self.blocks[0].attn_mode == 'torch':
             text_tokens_per_sample = text_hidden_states.shape[1] // batch_size
             self_attn_mask, cross_attn_mask = DenseAttnMaskBuilder.build_masks(
@@ -934,7 +964,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 f"Current attn_mode is {self.blocks[0].attn_mode!r}."
             )
 
-        for block in self.blocks:
+        block_t0 = time.perf_counter()
+        for block_idx, block in enumerate(self.blocks):
             hidden_states = block(hidden_states,
                                   text_hidden_states,
                                   timestep_proj,
@@ -942,6 +973,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                   self_attn_mask=self_attn_mask,
                                   cross_attn_mask=cross_attn_mask,
                                   update_cache=False)
+            if debug_first_step and block_idx in {0, 9, 19, len(self.blocks) - 1}:
+                _debug_first_step_log(
+                    f"block_{block_idx}_done elapsed={time.perf_counter() - block_t0:.2f}s total={time.perf_counter() - debug_t0:.2f}s"
+                )
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -959,6 +994,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_hidden_states = rearrange(action_hidden_states,
                                              '1 (b l) c -> b l c',
                                              b=batch_size)  #
+        if debug_first_step:
+            _debug_first_step_log(
+                f"forward_train_done total={time.perf_counter() - debug_t0:.2f}s"
+            )
+            self._debug_first_step_done = True
 
         return latent_hidden_states, action_hidden_states
 

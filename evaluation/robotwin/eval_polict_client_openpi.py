@@ -6,7 +6,15 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/home/syr/code/lingbot-va/RoboTwin")
+repo_root = Path(__file__).resolve().parents[2]
+robowin_root = Path(
+    os.environ.get("ROBOTWIN_ROOT", repo_root / "RoboTwin")
+).expanduser().resolve()
+if not robowin_root.exists():
+    raise FileNotFoundError(
+        f"RoboTwin root not found: {robowin_root}. "
+        "Set ROBOTWIN_ROOT or clone RoboTwin into the repository root."
+    )
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 

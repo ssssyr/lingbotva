@@ -86,7 +86,11 @@ def list_repo_files(
     state = load_state(state_path)
     saved_next_url = state.get("next_url")
     url = saved_next_url or f"{endpoint.rstrip('/')}/api/datasets/{repo_id}/tree/{revision}"
-    params = {"recursive": "true", "expand": "false", "limit": "1000"}
+    params = None if saved_next_url else {
+        "recursive": "true",
+        "expand": "false",
+        "limit": "1000",
+    }
     headers = {"Accept": "application/json"}
     count = int(state.get("count", 0))
     listing_complete = bool(state.get("listing_complete", False))
@@ -208,6 +212,21 @@ def main() -> int:
     )
     print(f"[list] total files={len(files)}", flush=True)
 
+    pending_files = []
+    skipped_existing = 0
+    for filename in files:
+        if (local_dir / filename).exists():
+            skipped_existing += 1
+            continue
+        pending_files.append(filename)
+
+    if skipped_existing:
+        print(
+            f"[download] skipping {skipped_existing} existing files",
+            flush=True,
+        )
+    print(f"[download] pending files={len(pending_files)}", flush=True)
+
     completed = 0
     failures: list[tuple[str, str]] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
@@ -221,15 +240,22 @@ def main() -> int:
                 args.revision,
                 args.retries,
             ): filename
-            for filename in files
+            for filename in pending_files
         }
         for future in as_completed(future_map):
             filename = future_map[future]
             try:
                 future.result()
                 completed += 1
-                if completed == 1 or completed % 100 == 0 or completed == len(files):
-                    print(f"[download] completed {completed}/{len(files)}", flush=True)
+                if (
+                    completed == 1
+                    or completed % 100 == 0
+                    or completed == len(pending_files)
+                ):
+                    print(
+                        f"[download] completed {completed}/{len(pending_files)}",
+                        flush=True,
+                    )
             except Exception as exc:  # pragma: no cover - best effort CLI utility
                 failures.append((filename, str(exc)))
                 print(f"[download] FAILED {filename}: {exc}", file=sys.stderr, flush=True)

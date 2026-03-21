@@ -126,6 +126,9 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         self.item_id_to_dataset_id, self.acc_dset_num = (
             self._get_item_id_to_dataset_id()
         )
+        self.bucket_keys = []
+        for dset in self._datasets:
+            self.bucket_keys.extend(dset.bucket_keys)
 
     def __len__(
         self,
@@ -204,6 +207,7 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def parse_meta(self):
         out = []
+        bucket_keys = []
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
@@ -223,7 +227,11 @@ class LatentLeRobotDataset(LeRobotDataset):
 
                 if check_statu:
                     out.append(cur_meta)
+                    bucket_keys.append(
+                        cur_meta["end_frame"] - cur_meta["start_frame"]
+                    )
         self.new_metas = out
+        self.bucket_keys = bucket_keys
 
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
