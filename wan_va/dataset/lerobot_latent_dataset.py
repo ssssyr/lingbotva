@@ -47,7 +47,20 @@ def construct_lerobot_multi_processor(config,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
+    repo_list = sorted(v.split('/meta/info.json')[0] for v in repo_list)
+    dataset_repo_filters = getattr(config, 'dataset_repo_filters', None)
+    if dataset_repo_filters:
+        dataset_repo_filters = [str(v).strip() for v in dataset_repo_filters if str(v).strip()]
+        if dataset_repo_filters:
+            repo_list = [
+                repo_id for repo_id in repo_list
+                if any(pattern in repo_id for pattern in dataset_repo_filters)
+            ]
+    max_dataset_repos = getattr(config, 'max_dataset_repos', None)
+    if max_dataset_repos is not None:
+        max_dataset_repos = int(max_dataset_repos)
+        if max_dataset_repos > 0:
+            repo_list = repo_list[:max_dataset_repos]
     num_repo = len(repo_list)
     num_init_worker = max(1, min(int(num_init_worker), num_repo)) if num_repo else 1
     print(
@@ -151,9 +164,13 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx) -> dict:
         assert idx < len(self)
-        cur_dset = self._datasets[self.item_id_to_dataset_id[idx]]
-        local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
-        return cur_dset[local_idx]
+        dataset_id = self.item_id_to_dataset_id[idx]
+        cur_dset = self._datasets[dataset_id]
+        local_idx = idx - self.acc_dset_num[dataset_id]
+        out = cur_dset[local_idx]
+        out['global_index'] = int(idx)
+        out['source_dataset_id'] = int(dataset_id)
+        return out
 
 class LatentLeRobotDataset(LeRobotDataset):
     def __init__(
@@ -360,6 +377,15 @@ class LatentLeRobotDataset(LeRobotDataset):
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
+        out_dict['sample_index'] = int(idx)
+        out_dict['episode_index'] = int(episode_index)
+        out_dict['local_start_frame'] = int(local_start_frame)
+        out_dict['local_end_frame'] = int(local_end_frame)
+        out_dict['dataset_repo_id'] = str(self.repo_id)
+        out_dict['state_uid'] = (
+            f"{self.repo_id}|episode_{episode_index:06d}|"
+            f"start_{local_start_frame}|end_{local_end_frame}"
+        )
         return out_dict
 
     def __len__(self):
