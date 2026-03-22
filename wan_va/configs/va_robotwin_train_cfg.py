@@ -69,3 +69,34 @@ va_robotwin_train_cfg.gradient_accumulation_steps = int(
 va_robotwin_train_cfg.num_steps = int(
     os.environ.get("LINGBOT_VA_NUM_STEPS", "50000")
 )
+
+# Model parameters
+va_robotwin_train_cfg.enable_action_residual_adapter = (
+    os.environ.get("LINGBOT_VA_ENABLE_ACTION_ADAPTER", "0") == "1"
+)
+va_robotwin_train_cfg.action_adapter_dim = int(
+    os.environ.get("LINGBOT_VA_ACTION_ADAPTER_DIM", "256")
+)
+va_robotwin_train_cfg.action_adapter_dropout = float(
+    os.environ.get("LINGBOT_VA_ACTION_ADAPTER_DROPOUT", "0.0")
+)
+
+# Trainable module switches
+va_robotwin_train_cfg.freeze_backbone = (
+    os.environ.get("LINGBOT_VA_FREEZE_BACKBONE", "0") == "1"
+)
+va_robotwin_train_cfg.freeze_embeddings = (
+    os.environ.get("LINGBOT_VA_FREEZE_EMBEDDINGS", "0") == "1"
+)
+va_robotwin_train_cfg.train_action_adapter = (
+    os.environ.get("LINGBOT_VA_TRAIN_ACTION_ADAPTER", "0") == "1"
+)
+va_robotwin_train_cfg.train_action_head = (
+    os.environ.get("LINGBOT_VA_TRAIN_ACTION_HEAD", "0") == "1"
+)
+va_robotwin_train_cfg.train_video_heads = (
+    os.environ.get("LINGBOT_VA_TRAIN_VIDEO_HEADS", "0") == "1"
+)
+va_robotwin_train_cfg.train_time_embedder = (
+    os.environ.get("LINGBOT_VA_TRAIN_TIME_EMBEDDER", "0") == "1"
+)

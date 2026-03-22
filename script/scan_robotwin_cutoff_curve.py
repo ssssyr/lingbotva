@@ -69,6 +69,23 @@ def parse_args():
         default=None,
         help="Device string, e.g. cuda:0 or cpu. Default: cuda:0 when available else cpu",
     )
+    parser.add_argument(
+        "--enable-action-adapter",
+        action="store_true",
+        help="Enable action residual adapter structure when loading transformer.",
+    )
+    parser.add_argument(
+        "--action-adapter-dim",
+        type=int,
+        default=256,
+        help="Action residual adapter bottleneck dimension.",
+    )
+    parser.add_argument(
+        "--action-adapter-dropout",
+        type=float,
+        default=0.0,
+        help="Action residual adapter dropout.",
+    )
     return parser.parse_args()
 
 
@@ -162,10 +179,16 @@ def main():
         num_workers=args.num_workers,
     )
 
+    model_overrides = {
+        "enable_action_residual_adapter": bool(args.enable_action_adapter),
+        "action_adapter_dim": int(args.action_adapter_dim),
+        "action_adapter_dropout": float(args.action_adapter_dropout),
+    }
     transformer = load_transformer(
         str(transformer_dir),
         torch_dtype=config.param_dtype,
         torch_device=device,
+        model_overrides=model_overrides,
     )
 
     scanner = CutoffScanner(
@@ -223,6 +246,9 @@ def main():
         "init_workers": int(args.init_workers),
         "max_datasets": int(args.max_datasets),
         "device": str(device),
+        "enable_action_adapter": bool(args.enable_action_adapter),
+        "action_adapter_dim": int(args.action_adapter_dim),
+        "action_adapter_dropout": float(args.action_adapter_dropout),
         "num_states_scanned": int(result["num_states"]),
     }
     args_path.write_text(json.dumps(run_args, ensure_ascii=False, indent=2), encoding="utf-8")

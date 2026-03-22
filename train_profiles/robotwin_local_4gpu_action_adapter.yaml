@@ -1,0 +1,46 @@
+launcher:
+  config_name: robotwin_train
+  ngpu: 4
+  master_port: 29511
+  log_rank: 0
+  torchft_lighthouse: http://localhost:29510
+  force_attn_mode: torch
+
+paths:
+  train_model_path: /home/syr/code/lingbotva/artifacts/models/lingbot-va-base
+  dataset_path: /data/syr/datasets/robotwin-clean-and-aug-lerobot
+  save_root: /data/syr/train_out/robotwin_local_4gpu_action_adapter
+  reference_model_path: /home/syr/code/lingbotva/artifacts/models/lingbot-va-base
+
+logging:
+  enable_wandb: false
+  wandb_project: va_robotwin
+  wandb_team_name: ""
+  wandb_base_url: ""
+  wandb_api_key: ""
+
+model:
+  enable_action_residual_adapter: true
+  action_adapter_dim: 256
+  action_adapter_dropout: 0.0
+
+trainable:
+  freeze_backbone: true
+  freeze_embeddings: true
+  train_action_adapter: true
+  train_action_head: true
+  train_video_heads: false
+  train_time_embedder: false
+
+training:
+  load_workers: 8
+  init_workers: 2
+  save_interval: 5000
+  gc_interval: 1000
+  cfg_prob: 0.1
+  learning_rate: 1e-5
+  weight_decay: 0.1
+  warmup_steps: 10
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  num_steps: 25000

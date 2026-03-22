@@ -42,10 +42,13 @@ def load_transformer(
     transformer_path,
     torch_dtype,
     torch_device,
+    model_overrides=None,
 ):
+    model_overrides = model_overrides or {}
     model = WanTransformer3DModel.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
+        **model_overrides,
     )
     return model.to(torch_device)
 

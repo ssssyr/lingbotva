@@ -610,6 +610,27 @@ class WanAttention(torch.nn.Module):
         return hidden_states
 
 
+class ResidualAdapter(nn.Module):
+
+    def __init__(self, dim, bottleneck_dim, eps=1e-6, dropout=0.0):
+        super().__init__()
+        self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.down = nn.Linear(dim, bottleneck_dim)
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout(dropout)
+        self.up = nn.Linear(bottleneck_dim, dim)
+        # Keep the adapter branch as a no-op at init via zero-initialized `up`,
+        # while preserving gradients into the adapter on the first step.
+        self.alpha = nn.Parameter(torch.ones(1))
+
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, hidden_states):
+        residual = self.up(self.drop(self.act(self.down(self.norm(hidden_states.float())))))
+        return (hidden_states.float() + self.alpha * residual.float()).type_as(hidden_states)
+
+
 class WanTransformerBlock(nn.Module):
 
     def __init__(
@@ -760,7 +781,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  eps=1e-06,
                  rope_max_seq_len=1024,
                  pos_embed_seq_len=None,
-                 attn_mode="torch"):
+                 attn_mode="torch",
+                 enable_action_residual_adapter=False,
+                 action_adapter_dim=256,
+                 action_adapter_dropout=0.0):
         r"""
         TODO
         """
@@ -796,6 +820,20 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 eps,
                                 attn_mode=attn_mode) for _ in range(num_layers)
         ])
+
+        self.enable_action_residual_adapter = enable_action_residual_adapter
+        if self.enable_action_residual_adapter:
+            self.action_residual_adapters = nn.ModuleList([
+                ResidualAdapter(
+                    inner_dim,
+                    action_adapter_dim,
+                    eps=eps,
+                    dropout=action_adapter_dropout,
+                )
+                for _ in range(num_layers)
+            ])
+        else:
+            self.action_residual_adapters = None
 
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim,
@@ -852,6 +890,31 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
         return temb, timestep_proj
+
+    def _apply_action_adapter_train(self, hidden_states, split_list, block_idx):
+        if self.action_residual_adapters is None:
+            return hidden_states
+
+        latent_hidden_states, condition_latent_hidden_states, action_hidden_states, condition_action_hidden_states, pad_states = \
+            torch.split(hidden_states, split_list, dim=1)
+
+        action_hidden_states = self.action_residual_adapters[block_idx](action_hidden_states)
+
+        return torch.cat(
+            [
+                latent_hidden_states,
+                condition_latent_hidden_states,
+                action_hidden_states,
+                condition_action_hidden_states,
+                pad_states,
+            ],
+            dim=1,
+        )
+
+    def _apply_action_adapter_infer(self, hidden_states, block_idx, action_mode):
+        if (self.action_residual_adapters is None) or (not action_mode):
+            return hidden_states
+        return self.action_residual_adapters[block_idx](hidden_states)
 
     def forward_train(self, input_dict):
         debug_first_step = _debug_first_step_enabled() and not getattr(
@@ -973,6 +1036,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                   self_attn_mask=self_attn_mask,
                                   cross_attn_mask=cross_attn_mask,
                                   update_cache=False)
+            hidden_states = self._apply_action_adapter_train(hidden_states, split_list, block_idx)
             if debug_first_step and block_idx in {0, 9, 19, len(self.blocks) - 1}:
                 _debug_first_step_log(
                     f"block_{block_idx}_done elapsed={time.perf_counter() - block_t0:.2f}s total={time.perf_counter() - debug_t0:.2f}s"
@@ -1062,13 +1126,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
             latent_hidden_states = block(latent_hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
                                          rotary_emb,
                                          update_cache=update_cache,
                                          cache_name=cache_name)
+            latent_hidden_states = self._apply_action_adapter_infer(
+                latent_hidden_states,
+                block_idx,
+                action_mode,
+            )
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

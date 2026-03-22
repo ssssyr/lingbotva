@@ -105,10 +105,16 @@ class Trainer:
         else:
             transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
 
+        model_overrides = {
+            "enable_action_residual_adapter": config.enable_action_residual_adapter,
+            "action_adapter_dim": config.action_adapter_dim,
+            "action_adapter_dropout": config.action_adapter_dropout,
+        }
         self.transformer = load_transformer(
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
+            model_overrides=model_overrides,
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -127,7 +133,9 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        self.transformer.requires_grad_(True)
+        self.configure_trainable_modules()
+        if self.config.rank == 0:
+            self.log_trainable_params()
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -189,7 +197,61 @@ class Trainer:
         self.train_loader_iter = None
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
-    
+
+    def _base_transformer(self):
+        return self.transformer.module if hasattr(self.transformer, "module") else self.transformer
+
+    def configure_trainable_modules(self):
+        base_transformer = self._base_transformer()
+        base_transformer.requires_grad_(False)
+
+        if not self.config.freeze_backbone:
+            base_transformer.blocks.requires_grad_(True)
+            base_transformer.norm_out.requires_grad_(True)
+
+        if not self.config.freeze_embeddings:
+            for module_name in [
+                "patch_embedding_mlp",
+                "action_embedder",
+                "condition_embedder",
+                "condition_embedder_action",
+            ]:
+                module = getattr(base_transformer, module_name, None)
+                if module is not None:
+                    module.requires_grad_(True)
+
+        if self.config.train_action_adapter:
+            adapters = getattr(base_transformer, "action_residual_adapters", None)
+            if adapters is not None:
+                adapters.requires_grad_(True)
+
+        if self.config.train_action_head:
+            base_transformer.action_proj_out.requires_grad_(True)
+
+        if self.config.train_video_heads:
+            base_transformer.proj_out.requires_grad_(True)
+
+        if self.config.train_time_embedder:
+            for name in ["condition_embedder", "condition_embedder_action", "scale_shift_table"]:
+                module = getattr(base_transformer, name, None)
+                if module is not None:
+                    module.requires_grad_(True)
+
+    def log_trainable_params(self):
+        base_transformer = self._base_transformer()
+        total = 0
+        trainable = 0
+        trainable_names = []
+        for name, param in base_transformer.named_parameters():
+            total += param.numel()
+            if param.requires_grad:
+                trainable += param.numel()
+                trainable_names.append(name)
+
+        logger.info("Trainable params: %d / %d", trainable, total)
+        for name in trainable_names[:50]:
+            logger.info("trainable: %s", name)
+
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
         if self.train_loader_iter is None:

@@ -76,6 +76,8 @@ launcher = get_section("launcher")
 paths = get_section("paths")
 logging = get_section("logging")
 training = get_section("training")
+model = get_section("model")
+trainable = get_section("trainable")
 
 assignments = {
     "CONFIG_NAME": env_override("CONFIG_NAME", launcher.get("config_name", "robotwin_train")),
@@ -104,6 +106,42 @@ assignments = {
     "LINGBOT_VA_BATCH_SIZE": env_override("LINGBOT_VA_BATCH_SIZE", training.get("batch_size", 1)),
     "LINGBOT_VA_GRAD_ACCUM_STEPS": env_override("LINGBOT_VA_GRAD_ACCUM_STEPS", training.get("gradient_accumulation_steps", 1)),
     "LINGBOT_VA_NUM_STEPS": env_override("LINGBOT_VA_NUM_STEPS", training.get("num_steps", 50000)),
+    "LINGBOT_VA_ENABLE_ACTION_ADAPTER": env_override(
+        "LINGBOT_VA_ENABLE_ACTION_ADAPTER",
+        int(bool(model.get("enable_action_residual_adapter", False))),
+    ),
+    "LINGBOT_VA_ACTION_ADAPTER_DIM": env_override(
+        "LINGBOT_VA_ACTION_ADAPTER_DIM",
+        model.get("action_adapter_dim", 256),
+    ),
+    "LINGBOT_VA_ACTION_ADAPTER_DROPOUT": env_override(
+        "LINGBOT_VA_ACTION_ADAPTER_DROPOUT",
+        model.get("action_adapter_dropout", 0.0),
+    ),
+    "LINGBOT_VA_FREEZE_BACKBONE": env_override(
+        "LINGBOT_VA_FREEZE_BACKBONE",
+        int(bool(trainable.get("freeze_backbone", False))),
+    ),
+    "LINGBOT_VA_FREEZE_EMBEDDINGS": env_override(
+        "LINGBOT_VA_FREEZE_EMBEDDINGS",
+        int(bool(trainable.get("freeze_embeddings", False))),
+    ),
+    "LINGBOT_VA_TRAIN_ACTION_ADAPTER": env_override(
+        "LINGBOT_VA_TRAIN_ACTION_ADAPTER",
+        int(bool(trainable.get("train_action_adapter", False))),
+    ),
+    "LINGBOT_VA_TRAIN_ACTION_HEAD": env_override(
+        "LINGBOT_VA_TRAIN_ACTION_HEAD",
+        int(bool(trainable.get("train_action_head", False))),
+    ),
+    "LINGBOT_VA_TRAIN_VIDEO_HEADS": env_override(
+        "LINGBOT_VA_TRAIN_VIDEO_HEADS",
+        int(bool(trainable.get("train_video_heads", False))),
+    ),
+    "LINGBOT_VA_TRAIN_TIME_EMBEDDER": env_override(
+        "LINGBOT_VA_TRAIN_TIME_EMBEDDER",
+        int(bool(trainable.get("train_time_embedder", False))),
+    ),
 }
 
 for key, value in assignments.items():
