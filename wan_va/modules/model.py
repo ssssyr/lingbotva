@@ -627,7 +627,8 @@ class ResidualAdapter(nn.Module):
         nn.init.zeros_(self.up.bias)
 
     def forward(self, hidden_states):
-        residual = self.up(self.drop(self.act(self.down(self.norm(hidden_states.float())))))
+        norm_hidden_states = self.norm(hidden_states.float()).to(dtype=self.down.weight.dtype)
+        residual = self.up(self.drop(self.act(self.down(norm_hidden_states))))
         return (hidden_states.float() + self.alpha * residual.float()).type_as(hidden_states)
 
 

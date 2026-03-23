@@ -7,10 +7,10 @@ launcher:
   force_attn_mode: torch
 
 paths:
-  train_model_path: /home/syr/code/lingbotva/artifacts/models/lingbot-va-base
-  dataset_path: /data/syr/datasets/robotwin-clean-and-aug-lerobot
+  train_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+  dataset_path: /mnt/sda/syr/lerobot_datasets/robotwin-clean-and-aug-lerobot
   save_root: /data/syr/train_out/robotwin_local_4gpu_action_adapter
-  reference_model_path: /home/syr/code/lingbotva/artifacts/models/lingbot-va-base
+  reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
 
 logging:
   enable_wandb: false

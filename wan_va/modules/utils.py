@@ -6,7 +6,7 @@ from transformers import (
     UMT5EncoderModel,
 )
 
-from .model import WanTransformer3DModel
+from .model import ResidualAdapter, WanTransformer3DModel
 
 
 def load_vae(
@@ -38,6 +38,35 @@ def load_tokenizer(tokenizer_path, ):
     return tokenizer
 
 
+def _materialize_missing_action_adapters(model, torch_dtype):
+    adapters = getattr(model, "action_residual_adapters", None)
+    if adapters is None:
+        return model
+
+    ref_param = next(
+        (param for param in model.parameters() if not getattr(param, "is_meta", False)),
+        None,
+    )
+    materialize_dtype = torch_dtype or (ref_param.dtype if ref_param is not None else torch.float32)
+    materialize_device = ref_param.device if ref_param is not None else torch.device("cpu")
+    if getattr(materialize_device, "type", None) == "meta":
+        materialize_device = torch.device("cpu")
+
+    for idx, adapter in enumerate(adapters):
+        if not any(getattr(param, "is_meta", False) for param in adapter.parameters()):
+            continue
+
+        new_adapter = ResidualAdapter(
+            adapter.down.in_features,
+            adapter.down.out_features,
+            eps=adapter.norm.eps,
+            dropout=adapter.drop.p,
+        ).to(device=materialize_device, dtype=materialize_dtype)
+        adapters[idx] = new_adapter
+
+    return model
+
+
 def load_transformer(
     transformer_path,
     torch_dtype,
@@ -50,6 +79,7 @@ def load_transformer(
         torch_dtype=torch_dtype,
         **model_overrides,
     )
+    model = _materialize_missing_action_adapters(model, torch_dtype)
     return model.to(torch_device)
 
 
