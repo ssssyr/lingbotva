@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# Remote high-utilization keepalive start command:
+# CFFF_REMOTE_ROOT=/tmp/lingbot-va-keepalive \
+# CFFF_CONDA_SH=/cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/miniconda3/etc/profile.d/conda.sh \
+# CFFF_CONDA_ENV=lingbot-va-cu118 \
+# ./script/cfff-run.sh "timestamp=\$(date +%Y%m%d-%H%M%S); log_file=logs/gpu-keepalive-python-\$timestamp.log; nohup python gpu_keepalive.py --gpus 0,1,2,3 --size 24576 --work-iters 2 --sleep-s 0.0 --report-every 10 --dtype bf16 > \"\$log_file\" 2>&1 < /dev/null & echo pid=\$!; echo log=\$log_file"
+#
+# Local direct run example:
+# python script/gpu_keepalive.py --gpus 0,1,2,3 --size 24576 --work-iters 2 --sleep-s 0.0 --report-every 10 --dtype bf16
+#
+# Stop remote keepalive:
+# CFFF_REMOTE_ROOT=/tmp/lingbot-va-keepalive ./script/cfff-run.sh "pkill -f gpu_keepalive.py"
 
 import argparse
 import multiprocessing as mp

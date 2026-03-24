@@ -4,12 +4,13 @@ launcher:
   master_port: 29501
   log_rank: 0
   torchft_lighthouse: http://localhost:29510
+  force_attn_mode: torch
 
 paths:
-  train_model_path: /home/ct_24210860031/models/lingbot-va-base
+  train_model_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/models/lingbot-va-posttrain-robotwin
   dataset_path: /home/ct_24210860031/812/SYR/datasets/robotwin-clean-and-aug-lerobot
-  save_root: ./train_out/robotwin_author_4gpu_eqbs8
-  reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+  save_root: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/code/lingbot-va/train_out/robotwin_author_4gpu_action_adapter_align
+  reference_model_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/models/lingbot-va-posttrain-robotwin
 
 logging:
   enable_wandb: false
@@ -18,15 +19,28 @@ logging:
   wandb_base_url: ""
   wandb_api_key: ""
 
+model:
+  enable_action_residual_adapter: true
+  action_adapter_dim: 256
+  action_adapter_dropout: 0.0
+
+trainable:
+  freeze_backbone: true
+  freeze_embeddings: true
+  train_action_adapter: true
+  train_action_head: true
+  train_video_heads: false
+  train_time_embedder: false
+
 training:
   load_workers: 16
   init_workers: 8
-  save_interval: 10000
+  save_interval: 2500
   gc_interval: 50
   cfg_prob: 0.1
   learning_rate: 1e-5
   weight_decay: 0.1
   warmup_steps: 10
-  batch_size: 1
+  batch_size: 2
   gradient_accumulation_steps: 2
-  num_steps: 50000
+  num_steps: 10000

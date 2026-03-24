@@ -119,6 +119,8 @@ class Trainer:
 
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
+        self.transformer.train()
+        self.configure_trainable_modules()
 
         logger.info(
             "Setting up distributed model (%s)...",
@@ -133,7 +135,6 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        self.configure_trainable_modules()
         if self.config.rank == 0:
             self.log_trainable_params()
 
@@ -358,9 +359,18 @@ class Trainer:
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
-        for key, value in input_dict.items():
-            input_dict[key] = value.to(self.device)#.to(self.dtype)
-        return input_dict
+        def move_to_device(value):
+            if isinstance(value, torch.Tensor):
+                return value.to(self.device)
+            if isinstance(value, dict):
+                return {k: move_to_device(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [move_to_device(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(move_to_device(v) for v in value)
+            return value
+
+        return move_to_device(input_dict)
 
     def compute_loss(self,
         input_dict,
