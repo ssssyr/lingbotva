@@ -1,0 +1,61 @@
+launcher:
+  config_name: robotwin_hazard_train
+  ngpu: 4
+  master_port: 29522
+  log_rank: 0
+  torchft_lighthouse: http://localhost:29510
+  force_attn_mode: torch
+
+paths:
+  train_model_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/models/lingbot-va-posttrain-robotwin
+  dataset_path: /home/ct_24210860031/812/SYR/datasets/robotwin-clean-and-aug-lerobot
+  save_root: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/code/lingbot-va/train_out/robotwin_hazard_4gpu
+  reference_model_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/models/lingbot-va-posttrain-robotwin
+
+logging:
+  enable_wandb: false
+  wandb_project: va_robotwin_hazard
+  wandb_team_name: ""
+  wandb_base_url: ""
+  wandb_api_key: ""
+
+model:
+  enable_action_residual_adapter: false
+  action_adapter_dim: 256
+  action_adapter_dropout: 0.0
+  # Hazard scheduler config
+  enable_hazard_scheduler: true
+  hazard_hidden_dim: 512
+  hazard_K_max: 10
+
+trainable:
+  # Freeze transformer during Hazard training
+  freeze_backbone: true
+  freeze_embeddings: true
+  train_action_adapter: false
+  train_action_head: false
+  train_video_heads: false
+  train_time_embedder: false
+  # Only train Hazard scheduler
+  train_hazard_scheduler: true
+
+training:
+  load_workers: 16
+  init_workers: 8
+  save_interval: 1000
+  gc_interval: 50
+  cfg_prob: 0.0  # No CFG during Hazard training
+  batch_size: 1  # CRITICAL: Must be 1 for current HazardScheduler (per-sample rollout)
+  gradient_accumulation_steps: 4  # Effective batch size = 4
+  num_steps: 10000
+
+# Hazard-specific training config
+hazard:
+  learning_rate: 1e-4
+  lambda_cost: 0.1  # Cost penalty for video steps
+  lambda_kl: 0.01  # KL regularization
+  baseline_K: 10  # Fixed K for baseline
+  K_min: 3  # Minimum steps before allowing stop
+  eta: 0.5  # Stopping threshold for deterministic inference
+  log_interval: 10
+  save_interval: 1000

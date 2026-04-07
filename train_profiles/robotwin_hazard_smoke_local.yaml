@@ -1,0 +1,60 @@
+launcher:
+  config_name: robotwin_hazard_train
+  ngpu: 1
+  master_port: 29532
+  log_rank: 0
+  torchft_lighthouse: http://localhost:29510
+  force_attn_mode: torch
+
+paths:
+  train_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+  dataset_path: /mnt/sda/syr/lerobot_datasets/robotwin-clean-and-aug-lerobot
+  save_root: /tmp/robotwin_hazard_smoke_local
+  reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+
+logging:
+  enable_wandb: false
+  wandb_project: va_robotwin_hazard
+  wandb_team_name: ""
+  wandb_base_url: ""
+  wandb_api_key: ""
+
+model:
+  enable_action_residual_adapter: false
+  action_adapter_dim: 256
+  action_adapter_dropout: 0.0
+  enable_hazard_scheduler: true
+  hazard_hidden_dim: 512
+  hazard_K_max: 10
+
+trainable:
+  freeze_backbone: true
+  freeze_embeddings: true
+  train_action_adapter: false
+  train_action_head: false
+  train_video_heads: false
+  train_time_embedder: false
+  train_hazard_scheduler: true
+
+training:
+  load_workers: 0
+  init_workers: 1
+  save_interval: 1
+  gc_interval: 1
+  cfg_prob: 0.0
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  num_steps: 1
+
+hazard:
+  learning_rate: 1e-4
+  lambda_cost: 0.1
+  lambda_kl: 0.01
+  baseline_K: 10
+  K_min: 3
+  eta: 0.5
+  log_interval: 1
+  save_interval: 1
+  val_split: 0.1
+
+max_dataset_repos: 1

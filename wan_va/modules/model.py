@@ -1074,6 +1074,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
+        return_video_features=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1089,10 +1090,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            return_video_features (bool, *optional*, defaults to False):
+                If True, returns (latent_hidden_states, video_pooled) where video_pooled
+                is the mean-pooled video features [B, C] for HazardScheduler.
+                Only applies when action_mode=False.
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            Tensor or Tuple[Tensor, Tensor]:
+                If return_video_features=False: latent_hidden_states
+                If return_video_features=True: (latent_hidden_states, video_pooled)
         """
         if train_mode:
             return self.forward_train(input_dict)
@@ -1148,6 +1154,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 (1. + scale) +
                                 shift).type_as(latent_hidden_states)
 
+        # Save backbone features BEFORE proj_out for HazardScheduler
+        if return_video_features and not action_mode:
+            # Pool backbone hidden states: mean over spatial tokens
+            video_pooled = latent_hidden_states.mean(dim=1)  # [B, C]
+
         if action_mode:
             latent_hidden_states = self.action_proj_out(latent_hidden_states)
         else:
@@ -1155,6 +1166,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_hidden_states = rearrange(latent_hidden_states,
                                              'b l (n c) -> b (l n) c',
                                              n=math.prod(self.patch_size))  #
+
+        # Return video features for HazardScheduler if requested
+        if return_video_features and not action_mode:
+            return latent_hidden_states, video_pooled
 
         return latent_hidden_states
 
