@@ -18,9 +18,19 @@ class TestHazardSchedulerHead:
         """Test that the module initializes correctly."""
         scheduler_head = HazardSchedulerHead(hidden_dim=768)
 
+        assert scheduler_head.feature_dim == 768
         assert scheduler_head.hidden_dim == 768
         assert scheduler_head.output_dim == 1
         assert not scheduler_head.use_context
+
+    def test_custom_hidden_width(self):
+        """Test that feature dimension and MLP hidden width can differ."""
+        scheduler_head = HazardSchedulerHead(feature_dim=768, hidden_dim=256)
+
+        assert scheduler_head.feature_dim == 768
+        assert scheduler_head.hidden_dim == 256
+        assert scheduler_head.mlp[0].in_features == 769
+        assert scheduler_head.mlp[0].out_features == 256
 
     def test_forward_pass(self):
         """Test forward pass with valid inputs."""

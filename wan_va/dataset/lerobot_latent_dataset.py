@@ -225,6 +225,11 @@ class LatentLeRobotDataset(LeRobotDataset):
     def parse_meta(self):
         out = []
         bucket_keys = []
+        max_bucket_key = getattr(self.config, "max_bucket_key", None)
+        if max_bucket_key is not None:
+            max_bucket_key = int(max_bucket_key)
+            if max_bucket_key <= 0:
+                max_bucket_key = None
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
@@ -243,9 +248,12 @@ class LatentLeRobotDataset(LeRobotDataset):
                 )
 
                 if check_statu:
+                    segment_length = cur_meta["end_frame"] - cur_meta["start_frame"]
+                    if max_bucket_key is not None and segment_length > max_bucket_key:
+                        continue
                     out.append(cur_meta)
                     bucket_keys.append(
-                        cur_meta["end_frame"] - cur_meta["start_frame"]
+                        segment_length
                     )
         self.new_metas = out
         self.bucket_keys = bucket_keys

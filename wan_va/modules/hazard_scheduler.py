@@ -20,39 +20,52 @@ class HazardSchedulerHead(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int,
+        feature_dim: int = None,
+        hidden_dim: int = None,
         output_dim: int = 1,
         use_context: bool = False,
         context_dim: int = 0,
     ):
         """
         Args:
-            hidden_dim: Dimension of video hidden features
+            feature_dim: Dimension of pooled video hidden features.
+                When omitted, falls back to `hidden_dim` for backward compatibility.
+            hidden_dim: Hidden width of the scheduler MLP.
+                When omitted, defaults to `feature_dim`.
             output_dim: Output dimension (default 1 for scalar Hazard)
             use_context: Whether to use additional context features
             context_dim: Dimension of context features (e.g., task embedding)
         """
         super().__init__()
 
-        self.hidden_dim = hidden_dim
+        if feature_dim is None and hidden_dim is None:
+            raise ValueError("Either feature_dim or hidden_dim must be provided")
+        if feature_dim is None:
+            feature_dim = hidden_dim
+        if hidden_dim is None:
+            hidden_dim = feature_dim
+
+        self.feature_dim = int(feature_dim)
+        self.hidden_dim = int(hidden_dim)
         self.output_dim = output_dim
         self.use_context = use_context
         self.context_dim = context_dim
+        bottleneck_dim = max(self.hidden_dim // 2, 1)
 
         # Input: video_feature + step_id + optional context
-        input_dim = hidden_dim + 1  # +1 for normalized step_id
+        input_dim = self.feature_dim + 1  # +1 for normalized step_id
         if use_context:
             input_dim += context_dim
 
         # MLP for Hazard prediction
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, self.hidden_dim),
             nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, bottleneck_dim),
             nn.GELU(),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.Linear(hidden_dim // 2, output_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.Linear(bottleneck_dim, output_dim),
         )
 
         # Initialize output layer to near zero
@@ -77,9 +90,14 @@ class HazardSchedulerHead(nn.Module):
         Returns:
             delta_H_k: [B, 1] non-negative Hazard increment
         """
+        param_dtype = self.mlp[0].weight.dtype
+        param_device = self.mlp[0].weight.device
+        video_feature = video_feature.to(device=param_device, dtype=param_dtype)
+
         # Ensure step_id is 2D
         if step_id.dim() == 1:
             step_id = step_id.unsqueeze(-1)
+        step_id = step_id.to(device=param_device, dtype=param_dtype)
 
         # Concatenate inputs
         x = torch.cat([video_feature, step_id], dim=-1)
@@ -87,13 +105,15 @@ class HazardSchedulerHead(nn.Module):
         if self.use_context:
             if context is None:
                 raise ValueError("context is required when use_context=True")
+            context = context.to(device=param_device, dtype=param_dtype)
             x = torch.cat([x, context], dim=-1)
 
         # Compute logit
         logit = self.mlp(x)
 
         # Apply softplus to ensure non-negativity
-        delta_H_k = F.softplus(logit)
+        delta_H_k = F.softplus(logit.float())
+        delta_H_k = torch.nan_to_num(delta_H_k, nan=0.0, posinf=20.0, neginf=0.0)
 
         return delta_H_k
 
@@ -110,6 +130,8 @@ class HazardSchedulerHead(nn.Module):
             h_k: [B, 1] stopping probability in [0, 1]
         """
         h_k = 1.0 - torch.exp(-delta_H_k)
+        h_k = torch.nan_to_num(h_k, nan=0.5, posinf=1.0, neginf=0.0)
+        h_k = torch.clamp(h_k, 1e-6, 1.0 - 1e-6)
         return h_k
 
     def compute_cumulative_hazard(self, delta_H_list: list) -> torch.Tensor:
@@ -253,7 +275,8 @@ class HazardScheduler:
         else:
             if self.mode == 'train':
                 # Stochastic sampling - use batch mean for single decision
-                h_k_mean = h_k.mean()
+                h_k_mean = torch.nan_to_num(h_k.mean(), nan=0.5, posinf=1.0 - 1e-6, neginf=1e-6)
+                h_k_mean = torch.clamp(h_k_mean, 1e-6, 1.0 - 1e-6)
                 should_stop = torch.bernoulli(h_k_mean).bool().item()
                 if should_stop:
                     log_prob = torch.log(h_k + 1e-8).mean()
