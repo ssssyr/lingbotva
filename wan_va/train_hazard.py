@@ -11,7 +11,9 @@ training loop for learning adaptive video denoising schedules.
 import argparse
 import os
 import sys
+import traceback
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -28,8 +30,29 @@ from wan_va.modules.utils import load_transformer
 from wan_va.configs import VA_CONFIGS
 from wan_va.utils.hazard_trainer import HazardTrainer
 from wan_va.dataset.lerobot_latent_dataset import MultiLatentLeRobotDataset
-from wan_va.utils import logger
+from wan_va.utils import init_logger, logger
+from wan_va.utils.hazard_monitor import HazardRunMonitor
 from torch.utils.data import DataLoader, DistributedSampler, Subset
+
+
+class ConfigNamespace(dict):
+    def __init__(self, d):
+        super().__init__()
+        for key, value in d.items():
+            if isinstance(value, dict):
+                value = ConfigNamespace(value)
+            self[key] = value
+            setattr(self, key, value)
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+        super().__setattr__(key, value)
 
 
 def parse_args():
@@ -37,6 +60,23 @@ def parse_args():
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
     return parser.parse_args()
+
+
+def _to_plain_python(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {k: _to_plain_python(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_python(v) for v in value]
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
 
 
 def load_config(config_path):
@@ -118,28 +158,6 @@ def load_config(config_path):
         if src_key in training_cfg:
             merged[dst_key] = training_cfg[src_key]
 
-    # Convert to namespace for easier access
-    class ConfigNamespace(dict):
-        def __init__(self, d):
-            super().__init__()
-            for key, value in d.items():
-                if isinstance(value, dict):
-                    value = ConfigNamespace(value)
-                else:
-                    value = value
-                self[key] = value
-                setattr(self, key, value)
-
-        def __getattr__(self, key):
-            try:
-                return self[key]
-            except KeyError as exc:
-                raise AttributeError(key) from exc
-
-        def __setattr__(self, key, value):
-            self[key] = value
-            super().__setattr__(key, value)
-
     return ConfigNamespace(merged)
 
 
@@ -179,6 +197,58 @@ def get_model_hidden_dim(transformer: WanTransformer3DModel) -> int:
     return int(config.num_attention_heads) * int(config.attention_head_dim)
 
 
+def get_scheduler_hidden_dim(config, default_dim: int) -> int:
+    """Return the configured scheduler hidden width."""
+    model_cfg = getattr(config, "model", None)
+    configured_dim = getattr(model_cfg, "hazard_hidden_dim", None)
+    if configured_dim is None:
+        return int(default_dim)
+    configured_dim = int(configured_dim)
+    if configured_dim <= 0:
+        raise ValueError(f"hazard_hidden_dim must be positive, got {configured_dim}")
+    return configured_dim
+
+
+def resolve_run_name(config, rank: int) -> str:
+    logging_cfg = getattr(config, "logging", None)
+    env_name = os.environ.get("LINGBOT_HAZARD_RUN_NAME")
+    configured_name = getattr(logging_cfg, "run_name", None)
+    configured_prefix = getattr(logging_cfg, "run_name_prefix", None)
+    if env_name:
+        return str(env_name)
+    return str(
+        configured_name
+        or f"{configured_prefix or getattr(getattr(config, 'launcher', None), 'config_name', 'hazard')}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+
+
+def prepare_run_directory(config, rank: int, world_size: int) -> Path:
+    base_save_root = Path(config.paths.save_root)
+    run_name = resolve_run_name(config, rank)
+    run_dir = base_save_root / "runs" / run_name
+
+    if rank == 0:
+        (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (run_dir / "metrics").mkdir(parents=True, exist_ok=True)
+        (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+        base_save_root.mkdir(parents=True, exist_ok=True)
+        (base_save_root / "latest_run.txt").write_text(str(run_dir), encoding="utf-8")
+        latest_link = base_save_root / "latest"
+        try:
+            if latest_link.is_symlink() or latest_link.exists():
+                latest_link.unlink()
+            latest_link.symlink_to(run_dir, target_is_directory=True)
+        except OSError:
+            pass
+
+    config.run_name = run_name
+    config.run_dir = str(run_dir)
+    config.paths.base_save_root = str(base_save_root)
+    config.paths.save_root = str(run_dir)
+    return run_dir
+
+
 def split_dataset_for_train(dataset, val_ratio: float = 0.1):
     """Simple holdout split so training does not consume the full dataset."""
     total = len(dataset)
@@ -204,11 +274,37 @@ def main():
     config.world_size = world_size
     config.local_rank = local_rank
 
+    run_dir = prepare_run_directory(config, rank=rank, world_size=world_size)
+    init_logger(
+        log_file=run_dir / "logs" / f"train_rank{rank}.log",
+        rank=rank,
+        console=(rank == 0),
+        force=True,
+    )
+
     # Setup device
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     dtype = torch.bfloat16
 
     logger.info(f"Rank {rank}/{world_size} on device {device}")
+    logger.info(f"Run name: {config.run_name}")
+    logger.info(f"Run dir: {run_dir}")
+    logger.info(f"Profile: {args.config}")
+
+    monitor = HazardRunMonitor(
+        run_dir=run_dir,
+        run_name=config.run_name,
+        config=config,
+        rank=rank,
+        world_size=world_size,
+    )
+    monitor.maybe_heartbeat(
+        step=0,
+        micro_step=0,
+        max_steps=int(getattr(config.training, "num_steps", 0)),
+        note="loading_transformer",
+        force=True,
+    )
 
     if int(config.training.batch_size) != 1:
         raise ValueError(
@@ -233,26 +329,44 @@ def main():
     transformer.eval()
     for param in transformer.parameters():
         param.requires_grad = False
+    monitor.maybe_heartbeat(
+        step=0,
+        micro_step=0,
+        max_steps=int(getattr(config.training, "num_steps", 0)),
+        note="creating_scheduler_head",
+        force=True,
+    )
 
     # Create Hazard scheduler head
     logger.info("Creating HazardSchedulerHead")
     video_feature_dim = get_model_hidden_dim(transformer)
+    scheduler_hidden_dim = get_scheduler_hidden_dim(config, video_feature_dim)
+    logger.info(
+        "HazardSchedulerHead dims: feature_dim=%d hidden_dim=%d",
+        video_feature_dim,
+        scheduler_hidden_dim,
+    )
     scheduler_head = HazardSchedulerHead(
-        hidden_dim=video_feature_dim,
+        feature_dim=video_feature_dim,
+        hidden_dim=scheduler_hidden_dim,
         output_dim=1,
         use_context=False,
-    ).to(device, dtype=dtype)
+    ).to(device=device, dtype=torch.float32)
 
-    # Only the trainable scheduler head needs DDP. The transformer stays frozen
-    # and can be replicated per rank without DistributedDataParallel.
-    if world_size > 1:
-        scheduler_head = torch.nn.parallel.DistributedDataParallel(
-            scheduler_head,
-            device_ids=[local_rank],
-            output_device=local_rank,
-        )
+    # Keep the scheduler head as a plain module. We synchronize its gradients
+    # manually in HazardTrainer to avoid DDP constructor collectives stalling
+    # on this environment during parameter verification.
+    if world_size > 1 and rank == 0:
+        logger.info("Scheduler head gradient sync mode: manual_all_reduce")
 
     # Create dataset
+    monitor.maybe_heartbeat(
+        step=0,
+        micro_step=0,
+        max_steps=int(getattr(config.training, "num_steps", 0)),
+        note="loading_dataset",
+        force=True,
+    )
     logger.info(f"Loading dataset from {config.paths.dataset_path}")
     dataset = MultiLatentLeRobotDataset(
         config=config,
@@ -273,19 +387,57 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
+    monitor.maybe_heartbeat(
+        step=0,
+        micro_step=0,
+        max_steps=int(getattr(config.training, "num_steps", 0)),
+        note="initializing_logging_backends",
+        force=True,
+    )
 
     # Setup WandB (only on rank 0)
     wandb = None
     if rank == 0 and getattr(config.logging, 'enable_wandb', False):
         import wandb as wandb_module
+
         wandb = wandb_module
-        wandb.init(
-            project=config.logging.wandb_project,
-            config=vars(config),
+        wandb_mode = getattr(config.logging, "wandb_mode", os.environ.get("WANDB_MODE", "offline"))
+        wandb_base_url = (
+            getattr(config.logging, "wandb_base_url", None)
+            or os.environ.get("WANDB_BASE_URL")
+            or None
         )
+        wandb_api_key = (
+            getattr(config.logging, "wandb_api_key", None)
+            or os.environ.get("WANDB_API_KEY")
+            or None
+        )
+        wandb_dir = run_dir / "wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        login_kwargs = {}
+        if wandb_base_url:
+            login_kwargs["host"] = wandb_base_url
+        if wandb_api_key:
+            login_kwargs["key"] = wandb_api_key
+        if wandb_mode == "online" and login_kwargs:
+            wandb.login(**login_kwargs)
+        init_kwargs = dict(
+            project=config.logging.wandb_project,
+            config=_to_plain_python(dict(config)),
+            name=config.run_name,
+            dir=str(wandb_dir),
+            mode=wandb_mode,
+        )
+        if wandb_base_url:
+            init_kwargs["settings"] = wandb.Settings(base_url=wandb_base_url)
+        wandb_entity = getattr(config.logging, "wandb_team_name", None) or None
+        if wandb_entity:
+            init_kwargs["entity"] = wandb_entity
+        wandb.init(**init_kwargs)
+        logger.info("WandB initialized (mode=%s)", wandb_mode)
 
     # Create trainer
-    save_dir = Path(config.paths.save_root)
+    save_dir = Path(config.paths.save_root) / "checkpoints"
     trainer = HazardTrainer(
         transformer=transformer,
         scheduler_head=scheduler_head,
@@ -295,16 +447,27 @@ def main():
         train_loader=train_loader,
         save_dir=save_dir,
         wandb=wandb,
+        monitor=monitor,
     )
 
-    # Start training
-    trainer.train()
-
-    # Cleanup
-    if world_size > 1:
-        dist.destroy_process_group()
-
-    logger.info("Training finished!")
+    try:
+        trainer.train()
+        logger.info("Training finished!")
+    except Exception as exc:
+        logger.exception("Hazard training failed")
+        monitor.mark_failed(
+            step=trainer.step,
+            micro_step=getattr(trainer, "micro_step", 0),
+            max_steps=trainer.max_steps,
+            error=str(exc),
+            traceback_text=traceback.format_exc(),
+        )
+        raise
+    finally:
+        if wandb is not None:
+            wandb.finish()
+        if world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == '__main__':

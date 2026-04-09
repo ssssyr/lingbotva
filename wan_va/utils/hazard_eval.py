@@ -9,6 +9,7 @@ comparing its performance against fixed-K baselines.
 """
 
 import argparse
+import os
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -26,10 +27,31 @@ from wan_va.modules.model import WanTransformer3DModel
 from wan_va.modules.hazard_scheduler import HazardSchedulerHead
 from wan_va.modules.utils import load_transformer
 from wan_va.configs import VA_CONFIGS
+from wan_va.utils.hazard_rollout_inputs import prepare_chunked_rollout_inputs
 from wan_va.utils.hazard_runtime import HazardRolloutRunner
 from wan_va.dataset.lerobot_latent_dataset import MultiLatentLeRobotDataset
-from wan_va.utils import logger
+from wan_va.utils import init_logger, logger
 from torch.utils.data import DataLoader, Subset
+
+
+class ConfigNamespace(dict):
+    def __init__(self, d):
+        super().__init__()
+        for key, value in d.items():
+            if isinstance(value, dict):
+                value = ConfigNamespace(value)
+            self[key] = value
+            setattr(self, key, value)
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+        super().__setattr__(key, value)
 
 
 class HazardEvaluator:
@@ -86,22 +108,14 @@ class HazardEvaluator:
         logger.info(f"  Baseline Ks: {self.baseline_Ks}")
 
     def _prepare_rollout_inputs(self, batch):
-        """Prepare inputs for rollout from batch."""
-        latents = batch['latents'].to(self.device, dtype=self.dtype)
-        actions = batch['actions'].to(self.device, dtype=self.dtype)
-        text_emb = batch['text_emb'].to(self.device, dtype=self.dtype)
-
-        video_noise = torch.randn_like(latents)
-        action_noise = torch.randn_like(actions)
-        latent_cond = latents[:, :, 0:1].clone()
-
-        return {
-            'video_noise': video_noise,
-            'action_noise': action_noise,
-            'text_emb': text_emb,
-            'gt_action': actions,
-            'latent_cond': latent_cond,
-        }
+        """Prepare rollout inputs aligned with real cached inference."""
+        return prepare_chunked_rollout_inputs(
+            batch=batch,
+            device=self.device,
+            dtype=self.dtype,
+            frame_chunk_size=int(self.config.frame_chunk_size),
+            sample_history=False,
+        )
 
     @torch.no_grad()
     def evaluate_sample(self, batch) -> Dict:
@@ -119,7 +133,11 @@ class HazardEvaluator:
             action_noise=rollout_inputs['action_noise'],
             text_emb=rollout_inputs['text_emb'],
             gt_action=rollout_inputs['gt_action'],
+            gt_action_mask=rollout_inputs['gt_action_mask'],
+            clean_history_latents=rollout_inputs['clean_history_latents'],
+            clean_history_actions=rollout_inputs['clean_history_actions'],
             latent_cond=rollout_inputs['latent_cond'],
+            action_cond=rollout_inputs['action_cond'],
             mode='eval',
         )
 
@@ -138,8 +156,12 @@ class HazardEvaluator:
                 action_noise=rollout_inputs['action_noise'],
                 text_emb=rollout_inputs['text_emb'],
                 gt_action=rollout_inputs['gt_action'],
+                gt_action_mask=rollout_inputs['gt_action_mask'],
                 K=K,
+                clean_history_latents=rollout_inputs['clean_history_latents'],
+                clean_history_actions=rollout_inputs['clean_history_actions'],
                 latent_cond=rollout_inputs['latent_cond'],
+                action_cond=rollout_inputs['action_cond'],
             )
 
             results[f'baseline_K{K}'] = {
@@ -336,27 +358,6 @@ def load_config(config_path):
         if src_key in training_cfg:
             merged[dst_key] = training_cfg[src_key]
 
-    class ConfigNamespace(dict):
-        def __init__(self, d):
-            super().__init__()
-            for key, value in d.items():
-                if isinstance(value, dict):
-                    value = ConfigNamespace(value)
-                else:
-                    value = value
-                self[key] = value
-                setattr(self, key, value)
-
-        def __getattr__(self, key):
-            try:
-                return self[key]
-            except KeyError as exc:
-                raise AttributeError(key) from exc
-
-        def __setattr__(self, key, value):
-            self[key] = value
-            super().__setattr__(key, value)
-
     return ConfigNamespace(merged)
 
 
@@ -374,6 +375,24 @@ def get_model_hidden_dim(transformer: WanTransformer3DModel) -> int:
     return int(config.num_attention_heads) * int(config.attention_head_dim)
 
 
+def get_scheduler_hidden_dim(config, default_dim: int) -> int:
+    model_cfg = getattr(config, "model", None)
+    configured_dim = getattr(model_cfg, "hazard_hidden_dim", None)
+    if configured_dim is None:
+        return int(default_dim)
+    configured_dim = int(configured_dim)
+    if configured_dim <= 0:
+        raise ValueError(f"hazard_hidden_dim must be positive, got {configured_dim}")
+    return configured_dim
+
+
+def normalize_scheduler_state_dict(state_dict):
+    keys = list(state_dict.keys())
+    if keys and all(key.startswith("module.") for key in keys):
+        return {key[len("module."):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
 def split_dataset_for_eval(dataset, val_ratio: float = 0.1):
     total = len(dataset)
     if total <= 1:
@@ -385,6 +404,7 @@ def split_dataset_for_eval(dataset, val_ratio: float = 0.1):
 
 
 def main():
+    init_logger(console=True, force=True)
     args = parse_args()
 
     # Load config
@@ -418,8 +438,15 @@ def main():
     # Create Hazard scheduler head
     logger.info("Creating HazardSchedulerHead")
     video_feature_dim = get_model_hidden_dim(transformer)
+    scheduler_hidden_dim = get_scheduler_hidden_dim(config, video_feature_dim)
+    logger.info(
+        "HazardSchedulerHead dims: feature_dim=%d hidden_dim=%d",
+        video_feature_dim,
+        scheduler_hidden_dim,
+    )
     scheduler_head = HazardSchedulerHead(
-        hidden_dim=video_feature_dim,
+        feature_dim=video_feature_dim,
+        hidden_dim=scheduler_hidden_dim,
         output_dim=1,
         use_context=False,
     ).to(device, dtype=dtype)
@@ -427,7 +454,9 @@ def main():
     # Load checkpoint
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    scheduler_head.load_state_dict(checkpoint['scheduler_head_state_dict'])
+    scheduler_head.load_state_dict(
+        normalize_scheduler_state_dict(checkpoint['scheduler_head_state_dict'])
+    )
     logger.info(f"Loaded checkpoint from step {checkpoint['step']}")
 
     # Create validation dataset

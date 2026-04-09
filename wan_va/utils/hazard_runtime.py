@@ -58,6 +58,7 @@ class HazardRolloutRunner:
 
         # Model configuration
         self.patch_size = tuple(config.patch_size)
+        self.frame_chunk_size = int(config.frame_chunk_size)
         self.action_dim = int(config.action_dim)
         self.action_per_frame = int(config.action_per_frame)
         self.num_video_steps = int(config.num_inference_steps)
@@ -201,13 +202,60 @@ class HazardRolloutRunner:
 
         return model_input
 
+    def _prefill_clean_history_cache(
+        self,
+        clean_history_latents: torch.Tensor,
+        clean_history_actions: torch.Tensor,
+        text_emb: torch.Tensor,
+    ) -> None:
+        """Populate cache with one clean history chunk using update_cache=2."""
+        if clean_history_latents is None or clean_history_actions is None:
+            return
+        if clean_history_latents.shape[2] == 0 or clean_history_actions.shape[2] == 0:
+            return
+
+        latent_input = self._prepare_input(
+            clean_history_latents,
+            text_emb,
+            0.0,
+            action_mode=False,
+            cond=None,
+            frame_st_id=0,
+        )
+        action_input = self._prepare_input(
+            clean_history_actions,
+            text_emb,
+            0.0,
+            action_mode=True,
+            cond=None,
+            frame_st_id=0,
+        )
+
+        with torch.no_grad():
+            self.transformer(
+                latent_input,
+                update_cache=2,
+                cache_name=self.cache_name,
+                action_mode=False,
+            )
+            self.transformer(
+                action_input,
+                update_cache=2,
+                cache_name=self.cache_name,
+                action_mode=True,
+            )
+
     def rollout_single_sample(
         self,
         video_noise: torch.Tensor,
         action_noise: torch.Tensor,
         text_emb: torch.Tensor,
         gt_action: torch.Tensor,
+        gt_action_mask: Optional[torch.Tensor] = None,
+        clean_history_latents: Optional[torch.Tensor] = None,
+        clean_history_actions: Optional[torch.Tensor] = None,
         latent_cond: Optional[torch.Tensor] = None,
+        action_cond: Optional[torch.Tensor] = None,
         mode: str = 'train',
     ) -> Tuple[List[Dict], torch.Tensor, float]:
         """
@@ -218,7 +266,9 @@ class HazardRolloutRunner:
             action_noise: [B, A, F, N, 1] initial action noise
             text_emb: [B, L, D] text embeddings
             gt_action: [B, A, F, N, 1] ground truth actions for reward
+            gt_action_mask: [B, A, F, N, 1] valid action mask for reward
             latent_cond: [B, C, 1, H, W] optional conditioning frame
+            action_cond: [B, A, 1, N, 1] optional conditioning action frame
             mode: 'train' (stochastic) or 'eval' (deterministic)
 
         Returns:
@@ -234,6 +284,7 @@ class HazardRolloutRunner:
 
         # Initialize cache
         self._init_cache(video_noise, action_noise)
+        self._prefill_clean_history_cache(clean_history_latents, clean_history_actions, text_emb)
 
         # Create HazardScheduler
         hazard_scheduler = HazardScheduler(
@@ -245,12 +296,7 @@ class HazardRolloutRunner:
         )
 
         # Prepare conditioning
-        if latent_cond is None:
-            latent_cond = torch.zeros(
-                [video_noise.shape[0], video_noise.shape[1], 1, video_noise.shape[3], video_noise.shape[4]],
-                device=self.device,
-                dtype=self.dtype,
-            )
+        chunk_frame_st_id = int(clean_history_latents.shape[2]) if clean_history_latents is not None else 0
 
         # Video rollout with adaptive stopping
         latents = video_noise.clone()
@@ -265,7 +311,8 @@ class HazardRolloutRunner:
                 text_emb,
                 t,
                 action_mode=False,
-                cond=latent_cond,
+                cond=(latent_cond if clean_history_latents is None else None),
+                frame_st_id=chunk_frame_st_id,
             )
 
             # Forward pass with feature extraction
@@ -297,7 +344,8 @@ class HazardRolloutRunner:
                     latents,
                     return_dict=False,
                 )
-                latents[:, :, 0:1] = latent_cond[:, :, 0:1]
+                if latent_cond is not None:
+                    latents[:, :, 0:1] = latent_cond[:, :, 0:1]
 
             # HazardScheduler decision (keep gradients for scheduler_head)
             # video_pooled comes from transformer with no_grad, but scheduler_head will recompute with gradients
@@ -307,8 +355,8 @@ class HazardRolloutRunner:
             # CRITICAL: Keep log_prob with gradients for REINFORCE training
             trajectory.append({
                 'step_idx': step_idx,
-                'delta_H_k': scheduler_result['delta_H_k'].detach(),
-                'h_k': scheduler_result['h_k'].detach(),
+                'delta_H_k': scheduler_result['delta_H_k'],
+                'h_k': scheduler_result['h_k'],
                 'log_prob': scheduler_result['log_prob'],  # Keep gradients!
                 'should_stop': scheduler_result['should_stop'],
                 'H_cumulative': scheduler_result['H_cumulative'],
@@ -321,17 +369,33 @@ class HazardRolloutRunner:
         # Refresh video cache at stop point
         stop_step = len(trajectory)
         with torch.no_grad():
-            self._refresh_video_cache_exact(latents, text_emb, latent_cond, stop_step)
+            self._refresh_video_cache_exact(
+                latents,
+                text_emb,
+                latent_cond,
+                stop_step,
+                frame_st_id=chunk_frame_st_id,
+            )
 
             # Generate actions from cache
-            final_action = self._run_action_from_cache(action_noise, text_emb)
+            final_action = self._run_action_from_cache(
+                action_noise,
+                text_emb,
+                action_cond=action_cond,
+                frame_st_id=chunk_frame_st_id,
+            )
 
         # Compute reward (no gradients needed)
-        reward = self._compute_reward(final_action, gt_action, stop_step)
+        reward = self._compute_reward(
+            final_action,
+            gt_action,
+            stop_step,
+            gt_action_mask=gt_action_mask,
+        )
 
         return trajectory, final_action, reward
 
-    def _refresh_video_cache_exact(self, latents, text_emb, latent_cond, cutoff_idx):
+    def _refresh_video_cache_exact(self, latents, text_emb, latent_cond, cutoff_idx, frame_st_id=0):
         """Refresh video cache at the cutoff point."""
         if cutoff_idx < self.num_video_steps:
             refresh_t = self.video_timesteps[cutoff_idx]
@@ -344,6 +408,7 @@ class HazardRolloutRunner:
             refresh_t,
             action_mode=False,
             cond=latent_cond,
+            frame_st_id=frame_st_id,
         )
         self.transformer(
             input_dict,
@@ -352,20 +417,9 @@ class HazardRolloutRunner:
             action_mode=False,
         )
 
-    def _run_action_from_cache(self, action_noise, text_emb):
+    def _run_action_from_cache(self, action_noise, text_emb, action_cond=None, frame_st_id=0):
         """Generate actions using cached video features."""
         actions = action_noise.clone()
-        action_cond = torch.zeros(
-            [
-                actions.shape[0],
-                self.action_dim,
-                1,
-                self.action_per_frame,
-                1,
-            ],
-            device=self.device,
-            dtype=self.dtype,
-        )
 
         for i, t in enumerate(self.action_timesteps_with_terminal):
             last_step = i == len(self.action_timesteps_with_terminal) - 1
@@ -375,6 +429,7 @@ class HazardRolloutRunner:
                 t,
                 action_mode=True,
                 cond=action_cond,
+                frame_st_id=frame_st_id,
             )
             action_noise_pred = self.transformer(
                 input_dict,
@@ -396,12 +451,13 @@ class HazardRolloutRunner:
                     return_dict=False,
                 )
 
-            actions[:, :, 0:1] = action_cond[:, :, 0:1]
+            if action_cond is not None:
+                actions[:, :, 0:1] = action_cond[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
         return actions
 
-    def _compute_reward(self, pred_action, gt_action, video_steps):
+    def _compute_reward(self, pred_action, gt_action, video_steps, gt_action_mask=None):
         """
         Compute reward: R = -L_act - lambda_cost * video_steps
 
@@ -409,12 +465,17 @@ class HazardRolloutRunner:
             pred_action: [B, A, F, N, 1] predicted actions
             gt_action: [B, A, F, N, 1] ground truth actions
             video_steps: number of video denoising steps used
+            gt_action_mask: [B, A, F, N, 1] valid action mask
 
         Returns:
             reward: scalar reward value
         """
-        # Compute action loss (MSE)
-        L_act = F.mse_loss(pred_action.float(), gt_action.float())
+        if gt_action_mask is None:
+            L_act = F.mse_loss(pred_action.float(), gt_action.float())
+        else:
+            mask = gt_action_mask.float()
+            denom = mask.sum().clamp_min(1.0)
+            L_act = ((pred_action.float() - gt_action.float()) ** 2 * mask).sum() / denom
 
         # Compute reward
         reward = -L_act.item() - self.lambda_cost * video_steps
@@ -428,7 +489,11 @@ class HazardRolloutRunner:
         text_emb: torch.Tensor,
         gt_action: torch.Tensor,
         K: int,
+        gt_action_mask: Optional[torch.Tensor] = None,
+        clean_history_latents: Optional[torch.Tensor] = None,
+        clean_history_actions: Optional[torch.Tensor] = None,
         latent_cond: Optional[torch.Tensor] = None,
+        action_cond: Optional[torch.Tensor] = None,
     ) -> Tuple[List[Dict], torch.Tensor, float]:
         """
         Execute rollout with fixed K steps (for baseline comparison).
@@ -438,8 +503,10 @@ class HazardRolloutRunner:
             action_noise: [B, A, F, N, 1] initial action noise
             text_emb: [B, L, D] text embeddings
             gt_action: [B, A, F, N, 1] ground truth actions
+            gt_action_mask: [B, A, F, N, 1] valid action mask for reward
             K: fixed number of video steps
             latent_cond: [B, C, 1, H, W] optional conditioning frame
+            action_cond: [B, A, 1, N, 1] optional conditioning action frame
 
         Returns:
             trajectory: Empty list (no scheduler decisions)
@@ -454,14 +521,10 @@ class HazardRolloutRunner:
 
         # Initialize cache
         self._init_cache(video_noise, action_noise)
+        self._prefill_clean_history_cache(clean_history_latents, clean_history_actions, text_emb)
 
         # Prepare conditioning
-        if latent_cond is None:
-            latent_cond = torch.zeros(
-                [video_noise.shape[0], video_noise.shape[1], 1, video_noise.shape[3], video_noise.shape[4]],
-                device=self.device,
-                dtype=self.dtype,
-            )
+        chunk_frame_st_id = int(clean_history_latents.shape[2]) if clean_history_latents is not None else 0
 
         # Run video denoising for K steps (no gradients needed for baseline)
         latents = video_noise.clone()
@@ -475,7 +538,8 @@ class HazardRolloutRunner:
                     text_emb,
                     t,
                     action_mode=False,
-                    cond=latent_cond,
+                    cond=(latent_cond if clean_history_latents is None else None),
+                    frame_st_id=chunk_frame_st_id,
                 )
 
                 video_noise_pred = self.transformer(
@@ -500,13 +564,30 @@ class HazardRolloutRunner:
                     latents,
                     return_dict=False,
                 )
-                latents[:, :, 0:1] = latent_cond[:, :, 0:1]
+                if latent_cond is not None:
+                    latents[:, :, 0:1] = latent_cond[:, :, 0:1]
 
             # Refresh cache and generate actions
-            self._refresh_video_cache_exact(latents, text_emb, latent_cond, K)
-            final_action = self._run_action_from_cache(action_noise, text_emb)
+            self._refresh_video_cache_exact(
+                latents,
+                text_emb,
+                latent_cond,
+                K,
+                frame_st_id=chunk_frame_st_id,
+            )
+            final_action = self._run_action_from_cache(
+                action_noise,
+                text_emb,
+                action_cond=action_cond,
+                frame_st_id=chunk_frame_st_id,
+            )
 
         # Compute reward
-        reward = self._compute_reward(final_action, gt_action, K)
+        reward = self._compute_reward(
+            final_action,
+            gt_action,
+            K,
+            gt_action_mask=gt_action_mask,
+        )
 
         return [], final_action, reward

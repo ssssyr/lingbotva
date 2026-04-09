@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from ..modules.hazard_scheduler import HazardSchedulerHead
+from .hazard_rollout_inputs import prepare_chunked_rollout_inputs
 from .hazard_runtime import HazardRolloutRunner
 from . import logger
 
@@ -55,6 +57,7 @@ class HazardTrainer:
         train_loader: DataLoader,
         save_dir: Path,
         wandb=None,
+        monitor=None,
     ):
         """
         Args:
@@ -76,6 +79,7 @@ class HazardTrainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.wandb = wandb
+        self.monitor = monitor
 
         # Training hyperparameters
         # Read from nested config: training.hazard.*
@@ -122,6 +126,7 @@ class HazardTrainer:
 
         # Training state
         self.step = 0
+        self.micro_step = 0
         self.train_loader_iter = None
 
         # Set transformer to eval mode (frozen during Hazard training)
@@ -166,54 +171,114 @@ class HazardTrainer:
         Returns:
             Dict with video_noise, action_noise, text_emb, gt_action, latent_cond
         """
-        # Move to device
-        latents = batch['latents'].to(self.device, dtype=self.dtype)
-        actions = batch['actions'].to(self.device, dtype=self.dtype)
-        text_emb = batch['text_emb'].to(self.device, dtype=self.dtype)
+        return prepare_chunked_rollout_inputs(
+            batch=batch,
+            device=self.device,
+            dtype=self.dtype,
+            frame_chunk_size=int(self.config.frame_chunk_size),
+            sample_history=True,
+        )
 
-        # Generate noise
-        video_noise = torch.randn_like(latents)
-        action_noise = torch.randn_like(actions)
+    @staticmethod
+    def _unwrap_scheduler_head(module):
+        return module.module if hasattr(module, "module") else module
 
-        # Extract conditioning frame (first frame)
-        latent_cond = latents[:, :, 0:1].clone()
+    @staticmethod
+    def _normalize_scheduler_state_dict(state_dict):
+        keys = list(state_dict.keys())
+        if keys and all(key.startswith("module.") for key in keys):
+            return {key[len("module."):]: value for key, value in state_dict.items()}
+        return state_dict
 
-        return {
-            'video_noise': video_noise,
-            'action_noise': action_noise,
-            'text_emb': text_emb,
-            'gt_action': actions,
-            'latent_cond': latent_cond,
-        }
-
-    def _compute_kl_regularization(self, trajectory, baseline_trajectory):
+    def _compute_kl_regularization(self, trajectory):
         """
-        Compute KL divergence between policy and baseline.
+        Compute KL divergence to a deterministic fixed-K stop policy.
 
-        KL(π || π_ref) = sum_k [h_k * log(h_k / h_ref_k) + (1-h_k) * log((1-h_k) / (1-h_ref_k))]
-
-        For simplicity, we use a Monte Carlo estimate based on the sampled trajectory.
+        For the reference policy, steps before `baseline_K` almost surely continue,
+        while the baseline step and later steps almost surely stop. This keeps the
+        learned scheduler close to the fixed-K rollout used for the reward baseline.
         """
-        if len(baseline_trajectory) == 0:
-            # Baseline used fixed K, no stochastic decisions
+        if len(trajectory) == 0:
             return torch.tensor(0.0, device=self.device)
 
-        kl_sum = 0.0
-        min_len = min(len(trajectory), len(baseline_trajectory))
+        eps = 1e-6
+        kl_sum = torch.tensor(0.0, device=self.device)
+        reference_stop_idx = max(int(self.baseline_K) - 1, 0)
 
-        for k in range(min_len):
-            h_k = trajectory[k]['h_k']
-            h_ref_k = baseline_trajectory[k]['h_k'] if k < len(baseline_trajectory) else torch.tensor(0.5, device=self.device)
-
-            # Clamp to avoid log(0)
+        for step_info in trajectory:
+            step_idx = int(step_info['step_idx'])
+            h_k = step_info['h_k']
             h_k = torch.clamp(h_k, 1e-6, 1 - 1e-6)
-            h_ref_k = torch.clamp(h_ref_k, 1e-6, 1 - 1e-6)
+            reference_prob = eps if step_idx < reference_stop_idx else 1.0 - eps
+            h_ref_k = torch.full_like(h_k, reference_prob)
 
             # Binary KL divergence
             kl = h_k * torch.log(h_k / h_ref_k) + (1 - h_k) * torch.log((1 - h_k) / (1 - h_ref_k))
-            kl_sum += kl.mean()
+            kl_sum = kl_sum + kl.mean()
 
-        return kl_sum
+        return kl_sum / max(len(trajectory), 1)
+
+    def _reduce_metrics(self, metrics: Dict[str, float]) -> Dict[str, float]:
+        reduced = dict(metrics)
+        if not dist.is_initialized():
+            return reduced
+
+        mean_keys = [
+            "policy_loss",
+            "kl_loss",
+            "total_loss",
+            "reward",
+            "baseline_reward",
+            "advantage",
+            "video_steps",
+            "grad_norm",
+            "lr",
+        ]
+        values = torch.tensor(
+            [float(metrics[key]) for key in mean_keys],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        dist.all_reduce(values, op=dist.ReduceOp.AVG)
+        for key, value in zip(mean_keys, values.tolist()):
+            reduced[key] = value
+
+        step_time = torch.tensor([float(metrics["step_time"])], dtype=torch.float32, device=self.device)
+        dist.all_reduce(step_time, op=dist.ReduceOp.MAX)
+        reduced["step_time"] = step_time.item()
+        return reduced
+
+    def _add_reward_decomposition(self, metrics: Dict[str, float]) -> Dict[str, float]:
+        enriched = dict(metrics)
+        reward = float(enriched["reward"])
+        baseline_reward = float(enriched["baseline_reward"])
+        video_steps = float(enriched["video_steps"])
+        baseline_video_steps = float(enriched["baseline_video_steps"])
+
+        enriched["compute_penalty"] = self.lambda_cost * video_steps
+        enriched["baseline_compute_penalty"] = self.lambda_cost * baseline_video_steps
+        enriched["compute_penalty_gap"] = (
+            enriched["baseline_compute_penalty"] - enriched["compute_penalty"]
+        )
+        enriched["implied_action_loss"] = -reward - enriched["compute_penalty"]
+        enriched["implied_baseline_action_loss"] = (
+            -baseline_reward - enriched["baseline_compute_penalty"]
+        )
+        enriched["implied_action_loss_gap"] = (
+            enriched["implied_action_loss"] - enriched["implied_baseline_action_loss"]
+        )
+        return enriched
+
+    def _sync_scheduler_gradients(self) -> None:
+        if not dist.is_initialized():
+            return
+
+        world_size = float(dist.get_world_size())
+        for param in self.scheduler_head.parameters():
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
 
     def _train_step(self, batch_idx):
         """
@@ -238,19 +303,27 @@ class HazardTrainer:
             action_noise=rollout_inputs['action_noise'],
             text_emb=rollout_inputs['text_emb'],
             gt_action=rollout_inputs['gt_action'],
+            gt_action_mask=rollout_inputs['gt_action_mask'],
+            clean_history_latents=rollout_inputs['clean_history_latents'],
+            clean_history_actions=rollout_inputs['clean_history_actions'],
             latent_cond=rollout_inputs['latent_cond'],
+            action_cond=rollout_inputs['action_cond'],
             mode='train',
         )
 
         # Execute baseline rollout (fixed K) - no gradients needed
         with torch.no_grad():
-            baseline_trajectory, baseline_pred_action, baseline_reward = self.rollout_runner.rollout_fixed_K(
+            _, baseline_pred_action, baseline_reward = self.rollout_runner.rollout_fixed_K(
                 video_noise=rollout_inputs['video_noise'],
                 action_noise=rollout_inputs['action_noise'],
                 text_emb=rollout_inputs['text_emb'],
                 gt_action=rollout_inputs['gt_action'],
+                gt_action_mask=rollout_inputs['gt_action_mask'],
                 K=self.baseline_K,
+                clean_history_latents=rollout_inputs['clean_history_latents'],
+                clean_history_actions=rollout_inputs['clean_history_actions'],
                 latent_cond=rollout_inputs['latent_cond'],
+                action_cond=rollout_inputs['action_cond'],
             )
 
         # Compute advantage
@@ -267,12 +340,10 @@ class HazardTrainer:
 
         policy_loss = policy_loss / max(len(trajectory), 1)
 
-        # Note: KL regularization is disabled because baseline uses fixed K (no stochastic policy)
-        # If needed, consider using entropy bonus instead: -lambda_entropy * sum(h_k * log(h_k))
-        kl_loss = 0.0
+        kl_loss = self._compute_kl_regularization(trajectory)
 
         # Total loss
-        total_loss = policy_loss
+        total_loss = policy_loss + self.lambda_kl * kl_loss
         total_loss = total_loss / self.gradient_accumulation_steps
 
         # Backward
@@ -280,16 +351,23 @@ class HazardTrainer:
 
         # Optimizer step (if accumulation is done)
         should_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        grad_norm = 0.0
+        lr = self.optimizer.param_groups[0]["lr"]
         if should_step:
+            self._sync_scheduler_gradients()
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.scheduler_head.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(self.scheduler_head.parameters(), max_norm=1.0)
+            grad_norm = float(grad_norm_tensor.item())
+            if torch.isfinite(torch.tensor(grad_norm)):
+                self.optimizer.step()
+            else:
+                logger.warning("Non-finite grad_norm detected at step=%s micro_step=%s; skipping optimizer step", self.step, self.micro_step)
+            self.optimizer.zero_grad(set_to_none=True)
 
         # Metrics
         metrics = {
             'policy_loss': policy_loss.item() * self.gradient_accumulation_steps,
-            'kl_loss': kl_loss,
+            'kl_loss': kl_loss.item(),
             'total_loss': total_loss.item() * self.gradient_accumulation_steps,
             'reward': reward,
             'baseline_reward': baseline_reward,
@@ -297,60 +375,135 @@ class HazardTrainer:
             'video_steps': len(trajectory),
             'baseline_video_steps': self.baseline_K,
             'step_time': time.perf_counter() - step_t0,
+            'grad_norm': grad_norm,
+            'lr': lr,
+            'should_step': should_step,
+            'segment_length': rollout_inputs.get('segment_length'),
+            'history_start_frame': rollout_inputs.get('history_start_frame'),
+            'history_end_frame': rollout_inputs.get('history_end_frame'),
+            'target_start_frame': rollout_inputs.get('target_start_frame'),
+            'target_end_frame': rollout_inputs.get('target_end_frame'),
         }
 
-        return metrics
+        return self._add_reward_decomposition(metrics)
 
     def train(self):
         """Main training loop."""
         logger.info("Starting Hazard training...")
 
-        pbar = tqdm(total=self.max_steps, desc="Training", disable=(self.config.rank != 0))
+        pbar = tqdm(
+            total=self.max_steps,
+            desc="HazardTrain",
+            disable=(self.config.rank != 0),
+            dynamic_ncols=True,
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.monitor is not None:
+            self.monitor.maybe_heartbeat(
+                step=self.step,
+                micro_step=self.micro_step,
+                max_steps=self.max_steps,
+                note="training_started",
+                force=True,
+            )
 
-        for batch_idx in range(self.max_steps):
-            metrics = self._train_step(batch_idx)
+        while self.step < self.max_steps:
+            metrics = self._train_step(self.micro_step)
+            self.micro_step += 1
 
-            # Update step counter
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                self.step += 1
+            if not metrics["should_step"]:
+                if self.monitor is not None:
+                    self.monitor.maybe_heartbeat(
+                        step=self.step,
+                        micro_step=self.micro_step,
+                        max_steps=self.max_steps,
+                        note="accumulating_gradients",
+                    )
+                continue
 
-            # Logging
-            if self.step % self.log_interval == 0 and self.config.rank == 0:
-                log_str = (
-                    f"Step {self.step} | "
-                    f"Loss: {metrics['total_loss']:.4f} | "
-                    f"Reward: {metrics['reward']:.4f} | "
-                    f"Baseline: {metrics['baseline_reward']:.4f} | "
-                    f"Adv: {metrics['advantage']:.4f} | "
-                    f"Steps: {metrics['video_steps']}/{metrics['baseline_video_steps']} | "
-                    f"Time: {metrics['step_time']:.2f}s"
+            self.step += 1
+            reduced_metrics = self._add_reward_decomposition(self._reduce_metrics(metrics))
+
+            if self.config.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(
+                    loss=f"{reduced_metrics['total_loss']:.4f}",
+                    reward=f"{reduced_metrics['reward']:.4f}",
+                    steps=f"{reduced_metrics['video_steps']:.2f}",
+                    grad=f"{reduced_metrics['grad_norm']:.2f}",
                 )
-                logger.info(log_str)
+
+                if self.monitor is not None:
+                    self.monitor.log_metrics(
+                        step=self.step,
+                        micro_step=self.micro_step,
+                        max_steps=self.max_steps,
+                        metrics=reduced_metrics,
+                    )
+
+                if self.step == 1 or self.step % self.log_interval == 0:
+                    log_str = (
+                        f"Step {self.step}/{self.max_steps} | "
+                        f"Loss: {reduced_metrics['total_loss']:.4f} "
+                        f"(policy={reduced_metrics['policy_loss']:.4f}, kl={reduced_metrics['kl_loss']:.4f}) | "
+                        f"Reward: {reduced_metrics['reward']:.4f} | "
+                        f"Baseline: {reduced_metrics['baseline_reward']:.4f} | "
+                        f"Adv: {reduced_metrics['advantage']:.4f} | "
+                        f"ActLoss: {reduced_metrics['implied_action_loss']:.4f} "
+                        f"(base={reduced_metrics['implied_baseline_action_loss']:.4f}) | "
+                        f"VideoSteps: {reduced_metrics['video_steps']:.2f}/{reduced_metrics['baseline_video_steps']} | "
+                        f"GradNorm: {reduced_metrics['grad_norm']:.2f} | "
+                        f"LR: {reduced_metrics['lr']:.2e} | "
+                        f"StepTime(max): {reduced_metrics['step_time']:.2f}s"
+                    )
+                    logger.info(log_str)
 
                 if self.wandb is not None:
-                    self.wandb.log({
-                        'train/policy_loss': metrics['policy_loss'],
-                        'train/kl_loss': metrics['kl_loss'],
-                        'train/total_loss': metrics['total_loss'],
-                        'train/reward': metrics['reward'],
-                        'train/baseline_reward': metrics['baseline_reward'],
-                        'train/advantage': metrics['advantage'],
-                        'train/video_steps': metrics['video_steps'],
-                        'train/step_time': metrics['step_time'],
-                    }, step=self.step)
+                    self.wandb.log(
+                        {
+                            'train/policy_loss': reduced_metrics['policy_loss'],
+                            'train/kl_loss': reduced_metrics['kl_loss'],
+                            'train/total_loss': reduced_metrics['total_loss'],
+                            'train/reward': reduced_metrics['reward'],
+                            'train/baseline_reward': reduced_metrics['baseline_reward'],
+                            'train/advantage': reduced_metrics['advantage'],
+                            'train/video_steps': reduced_metrics['video_steps'],
+                            'train/implied_action_loss': reduced_metrics['implied_action_loss'],
+                            'train/implied_baseline_action_loss': reduced_metrics['implied_baseline_action_loss'],
+                            'train/implied_action_loss_gap': reduced_metrics['implied_action_loss_gap'],
+                            'train/compute_penalty': reduced_metrics['compute_penalty'],
+                            'train/baseline_compute_penalty': reduced_metrics['baseline_compute_penalty'],
+                            'train/compute_penalty_gap': reduced_metrics['compute_penalty_gap'],
+                            'train/grad_norm': reduced_metrics['grad_norm'],
+                            'train/lr': reduced_metrics['lr'],
+                            'train/step_time_max': reduced_metrics['step_time'],
+                            'train/micro_step': self.micro_step,
+                        },
+                        step=self.step,
+                    )
 
-            # Save checkpoint
-            if self.step % self.save_interval == 0 and self.config.rank == 0:
-                self.save_checkpoint()
-
-            pbar.update(1)
+                if self.step % self.save_interval == 0:
+                    checkpoint_path = self.save_checkpoint()
+                    if self.monitor is not None:
+                        self.monitor.note_checkpoint(
+                            step=self.step,
+                            checkpoint_path=checkpoint_path,
+                            final=False,
+                        )
 
         pbar.close()
         logger.info("Training completed!")
 
         # Save final checkpoint
         if self.config.rank == 0:
-            self.save_checkpoint(final=True)
+            final_path = self.save_checkpoint(final=True)
+            if self.monitor is not None:
+                self.monitor.note_checkpoint(
+                    step=self.step,
+                    checkpoint_path=final_path,
+                    final=True,
+                )
+                self.monitor.mark_finished(step=self.step, max_steps=self.max_steps)
 
     def save_checkpoint(self, final=False):
         """Save checkpoint."""
@@ -359,20 +512,25 @@ class HazardTrainer:
         else:
             ckpt_path = self.save_dir / f"hazard_scheduler_step_{self.step}.pt"
 
+        scheduler_head = self._unwrap_scheduler_head(self.scheduler_head)
         checkpoint = {
             'step': self.step,
-            'scheduler_head_state_dict': self.scheduler_head.state_dict(),
+            'scheduler_head_state_dict': scheduler_head.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': _to_plain_python(dict(self.config)),
         }
 
         torch.save(checkpoint, ckpt_path)
         logger.info(f"Checkpoint saved to {ckpt_path}")
+        return ckpt_path
 
     def load_checkpoint(self, ckpt_path):
         """Load checkpoint."""
         checkpoint = torch.load(ckpt_path, map_location=self.device)
-        self.scheduler_head.load_state_dict(checkpoint['scheduler_head_state_dict'])
+        scheduler_head = self._unwrap_scheduler_head(self.scheduler_head)
+        scheduler_head.load_state_dict(
+            self._normalize_scheduler_state_dict(checkpoint['scheduler_head_state_dict'])
+        )
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.step = checkpoint['step']
         logger.info(f"Checkpoint loaded from {ckpt_path}, resuming from step {self.step}")
