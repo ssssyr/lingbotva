@@ -72,7 +72,10 @@ def run_async_server_mode(model, local_rank, host, port):
     logger.info("Running in ASYNC SERVER mode")
     if local_rank == 0:
         dist_model = DistributedModelWrapper(model, local_rank=local_rank)
-        model_server = WebsocketPolicyServer(dist_model, host=host, port=port)
+        metadata = {}
+        if hasattr(model, "get_server_metadata"):
+            metadata = model.get_server_metadata()
+        model_server = WebsocketPolicyServer(dist_model, host=host, port=port, metadata=metadata)
         model_server.serve_forever()
 
         if dist.is_initialized():

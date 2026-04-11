@@ -48,8 +48,31 @@ echo "server config:"
 echo "  gpu_id=${gpu_id}"
 echo "  port=${START_PORT}"
 echo "  save_root=${save_root}"
+echo "  video_guidance_scale=${video_guidance_scale:-5}"
+echo "  action_guidance_scale=${action_guidance_scale:-1}"
+echo "  online_scheduler_mode=${online_scheduler_mode:-fixed}"
+echo "  fixed_video_steps=${fixed_video_steps:-25}"
+echo "  enable_hazard_scheduler_runtime=${enable_hazard_scheduler_runtime:-false}"
+if [[ -n "${hazard_checkpoint_path:-}" ]]; then
+    echo "  hazard_checkpoint_path=${hazard_checkpoint_path}"
+fi
+
+hazard_enabled_normalized="$(echo "${enable_hazard_scheduler_runtime:-false}" | tr '[:upper:]' '[:lower:]')"
+hazard_return_metadata_normalized="$(echo "${hazard_return_metadata:-true}" | tr '[:upper:]' '[:lower:]')"
 
 CUDA_VISIBLE_DEVICES=${gpu_id} python wan_va/wan_va_server.py \
     --config-name robotwin \
     --port "$START_PORT" \
-    --save_root "$save_root"
+    --save_root "$save_root" \
+    --guidance-scale "${video_guidance_scale:-5}" \
+    --action-guidance-scale "${action_guidance_scale:-1}" \
+    --online-scheduler-mode "${online_scheduler_mode:-fixed}" \
+    --fixed-video-steps "${fixed_video_steps:-25}" \
+    --enable-hazard-scheduler-runtime "$([[ "${hazard_enabled_normalized}" == "true" ]] && echo 1 || echo 0)" \
+    --hazard-checkpoint "${hazard_checkpoint_path:-}" \
+    --hazard-eta "${hazard_eta:-0.5}" \
+    --hazard-k-min "${hazard_k_min:-3}" \
+    --hazard-k-max "${hazard_k_max:-25}" \
+    --hazard-feature-source "${hazard_feature_source:-cond}" \
+    --hazard-return-metadata "$([[ "${hazard_return_metadata_normalized}" == "true" ]] && echo 1 || echo 0)" \
+    --save-debug-artifacts "$([[ "$(echo "${save_debug_artifacts:-true}" | tr '[:upper:]' '[:lower:]')" == "true" ]] && echo 1 || echo 0)"

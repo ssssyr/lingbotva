@@ -65,6 +65,13 @@ def write_json(data: dict, fpath: Path) -> None:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 
+def append_jsonl(data: dict, fpath: Path) -> None:
+    """Append one JSON object as a JSONL record."""
+    fpath.parent.mkdir(exist_ok=True, parents=True)
+    with open(fpath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
 def outcome_video_path(base_dir: Path, succ: bool) -> Path:
     return base_dir / ("success.mp4" if succ else "failure.mp4")
 
@@ -413,6 +420,8 @@ def main(usr_args):
 
     
     model = WebsocketClientPolicy(port=usr_args['port'])
+    server_metadata = model.get_server_metadata()
+    print(f"server_metadata={server_metadata}")
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -424,7 +433,8 @@ def main(usr_args):
                                    instruction_type=instruction_type,
                                    save_visualization=True,
                                    video_guidance_scale=video_guidance_scale,
-                                   action_guidance_scale=action_guidance_scale)
+                                   action_guidance_scale=action_guidance_scale,
+                                   server_metadata=server_metadata)
     suc_nums.append(suc_num)
 
     file_path = os.path.join(save_dir, f"_result.txt")
@@ -466,7 +476,8 @@ def eval_policy(task_name,
                 instruction_type=None,
                 save_visualization=False,
                 video_guidance_scale=5.0,
-                action_guidance_scale=5.0):
+                action_guidance_scale=5.0,
+                server_metadata=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -474,9 +485,20 @@ def eval_policy(task_name,
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
+    save_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'metrics' / task_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    episodes_jsonl_path = save_dir / 'episodes.jsonl'
+    if episodes_jsonl_path.exists():
+        episodes_jsonl_path.unlink()
+
     now_id = 0
     succ_seed = 0
     suc_test_seed_list = []
+    scheduler_video_steps = []
+    scheduler_modes = set()
+    scheduler_total_runtime_ms = []
+    scheduler_video_runtime_ms = []
+    scheduler_action_runtime_ms = []
 
 
     now_seed = st_seed
@@ -574,6 +596,7 @@ def eval_policy(task_name,
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
+        episode_chunk_scheduler = []
 
         initial_obs = TASK_ENV.get_obs() 
         inint_eef_pose = initial_obs['endpose']['left_endpose'] + \
@@ -589,8 +612,26 @@ def eval_policy(task_name,
                 observation = TASK_ENV.get_obs()
                 first_obs = format_obs(observation, prompt)
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization)) #(TASK_ENV, model, observation)
             action = ret['action']
+            scheduler_meta = ret.get('scheduler_meta')
+            if isinstance(scheduler_meta, dict):
+                chunk_meta = dict(scheduler_meta)
+                chunk_meta["chunk_index"] = int(len(episode_chunk_scheduler))
+                chunk_meta["take_action_cnt_before_chunk"] = int(TASK_ENV.take_action_cnt)
+                chunk_meta["action_chunk_frames"] = int(action.shape[1])
+                chunk_meta["action_steps_per_frame"] = int(action.shape[2])
+                episode_chunk_scheduler.append(chunk_meta)
+                if scheduler_meta.get('mode') is not None:
+                    scheduler_modes.add(str(scheduler_meta['mode']))
+                if scheduler_meta.get('video_steps_used') is not None:
+                    scheduler_video_steps.append(float(scheduler_meta['video_steps_used']))
+                if scheduler_meta.get('total_runtime_ms') is not None:
+                    scheduler_total_runtime_ms.append(float(scheduler_meta['total_runtime_ms']))
+                if scheduler_meta.get('video_runtime_ms') is not None:
+                    scheduler_video_runtime_ms.append(float(scheduler_meta['video_runtime_ms']))
+                if scheduler_meta.get('action_runtime_ms') is not None:
+                    scheduler_action_runtime_ms.append(float(scheduler_meta['action_runtime_ms']))
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
@@ -683,13 +724,44 @@ def eval_policy(task_name,
 
         TASK_ENV.test_num += 1
 
-        save_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'metrics' / task_name
-        save_dir.mkdir(parents=True, exist_ok=True)
+        episode_record = {
+          "episode_index": int(TASK_ENV.test_num - 1),
+          "seed": int(now_seed),
+          "success": bool(succ),
+          "task_name": task_name,
+          "prompt": prompt,
+          "chunk_count": int(len(episode_chunk_scheduler)),
+          "video_guidance_scale": float(video_guidance_scale),
+          "action_guidance_scale": float(action_guidance_scale),
+          "server_metadata": dict(server_metadata or {}),
+          "scheduler_chunks": episode_chunk_scheduler,
+        }
+        if episode_chunk_scheduler:
+            per_episode_video_steps = [float(chunk["video_steps_used"]) for chunk in episode_chunk_scheduler if chunk.get("video_steps_used") is not None]
+            per_episode_total_ms = [float(chunk["total_runtime_ms"]) for chunk in episode_chunk_scheduler if chunk.get("total_runtime_ms") is not None]
+            episode_record["scheduler_video_steps_mean"] = float(np.mean(per_episode_video_steps)) if per_episode_video_steps else None
+            episode_record["scheduler_video_steps_min"] = float(np.min(per_episode_video_steps)) if per_episode_video_steps else None
+            episode_record["scheduler_video_steps_max"] = float(np.max(per_episode_video_steps)) if per_episode_video_steps else None
+            episode_record["scheduler_total_runtime_ms_mean"] = float(np.mean(per_episode_total_ms)) if per_episode_total_ms else None
+        append_jsonl(episode_record, save_dir / 'episodes.jsonl')
         out_json_file = save_dir / 'res.json'
         write_json({
           "succ_num": float(TASK_ENV.suc),
           "total_num": float(TASK_ENV.test_num),
           "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
+          "video_guidance_scale": float(video_guidance_scale),
+          "action_guidance_scale": float(action_guidance_scale),
+          "server_metadata": dict(server_metadata or {}),
+          "scheduler_chunk_count": int(len(scheduler_video_steps)),
+          "scheduler_video_steps_mean": float(np.mean(scheduler_video_steps)) if scheduler_video_steps else None,
+          "scheduler_video_steps_std": float(np.std(scheduler_video_steps)) if scheduler_video_steps else None,
+          "scheduler_video_steps_min": float(np.min(scheduler_video_steps)) if scheduler_video_steps else None,
+          "scheduler_video_steps_max": float(np.max(scheduler_video_steps)) if scheduler_video_steps else None,
+          "scheduler_total_runtime_ms_mean": float(np.mean(scheduler_total_runtime_ms)) if scheduler_total_runtime_ms else None,
+          "scheduler_total_runtime_ms_std": float(np.std(scheduler_total_runtime_ms)) if scheduler_total_runtime_ms else None,
+          "scheduler_video_runtime_ms_mean": float(np.mean(scheduler_video_runtime_ms)) if scheduler_video_runtime_ms else None,
+          "scheduler_action_runtime_ms_mean": float(np.mean(scheduler_action_runtime_ms)) if scheduler_action_runtime_ms else None,
+          "scheduler_modes": sorted(scheduler_modes),
         }, out_json_file)
         
         print(

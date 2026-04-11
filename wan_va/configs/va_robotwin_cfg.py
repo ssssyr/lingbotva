@@ -31,6 +31,17 @@ va_robotwin_cfg.action_guidance_scale = 1
 va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
+va_robotwin_cfg.online_scheduler_mode = "fixed"
+va_robotwin_cfg.fixed_video_steps = 25
+va_robotwin_cfg.enable_hazard_scheduler_runtime = False
+va_robotwin_cfg.hazard_checkpoint_path = ""
+va_robotwin_cfg.hazard_hidden_dim = 512
+va_robotwin_cfg.hazard_K_max = 25
+va_robotwin_cfg.hazard_K_min = 3
+va_robotwin_cfg.hazard_eta = 0.5
+va_robotwin_cfg.hazard_feature_source = "cond"
+va_robotwin_cfg.hazard_return_metadata = True
+va_robotwin_cfg.save_debug_artifacts = True
 
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0

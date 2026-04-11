@@ -23,3 +23,13 @@ port: 29056
 
 video_guidance_scale: 5
 action_guidance_scale: 1
+online_scheduler_mode: "fixed"
+fixed_video_steps: 25
+enable_hazard_scheduler_runtime: false
+hazard_checkpoint_path: ""
+hazard_eta: 0.5
+hazard_k_min: 3
+hazard_k_max: 25
+hazard_feature_source: "cond"
+hazard_return_metadata: true
+save_debug_artifacts: true
