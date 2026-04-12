@@ -51,8 +51,33 @@ hazard:
   lambda_cost: 0.1
   lambda_kl: 0.01
   baseline_K: 10
+  kl_reference_K: 10
   K_min: 3
   eta: 0.5
+  reward_adv_baseline: ema
+  reward_ema_decay: 0.95
+  reward_anchor_lo_k: 4
+  reward_anchor_hi_k: 10
+  reward_skip_initial_action_frames: 1
+  reward_w_seq: 0.7
+  reward_w_delta: 0.3
+  reward_lambda_neg: 1.0
+  reward_lambda_c: 0.4
+  reward_pos_weight: 1.0
+  reward_rot_weight: 0.6
+  reward_gripper_weight: 0.8
+  reward_delta_pos_weight: 1.0
+  reward_delta_rot_weight: 0.2
+  reward_delta_gripper_weight: 0.6
+  reward_gap_epsilon: 1e-4
+  reward_difficulty_kappa: 0.1
+  reward_time_rho: 0.08
+  reward_time_eta_motion: 0.6
+  reward_time_eta_gripper: 1.2
+  reward_time_eta_early: 0.0
+  reward_cost_c0: 0.2
+  reward_cost_c1: 0.8
+  reward_cost_gamma: 2.0
   log_interval: 1
   save_interval: 1
   val_split: 0.1

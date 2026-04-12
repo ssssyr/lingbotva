@@ -66,6 +66,9 @@ def fmt_duration(seconds):
 
 def enrich_reward_decomposition(metrics):
     metrics = dict(metrics or {})
+    if "quality" in metrics or "q_seq" in metrics or "q_delta" in metrics:
+        return metrics
+
     required = ("reward", "baseline_reward", "video_steps", "baseline_video_steps")
     if any(metrics.get(key) is None for key in required):
         return metrics
@@ -129,22 +132,36 @@ def render_status(run_dir: Path):
             f"advantage={metrics.get('advantage', '?')}"
         ),
         (
+            "quality="
+            f"{metrics.get('quality', '?')} "
+            f"cost={metrics.get('cost', '?')} "
+            f"ema={metrics.get('ema_baseline', '?')}"
+        ),
+        (
             "video_steps="
             f"{metrics.get('video_steps', '?')} "
+            f"lo={metrics.get('anchor_lo_steps', '?')} "
+            f"hi={metrics.get('anchor_hi_steps', '?')} "
             f"grad_norm={metrics.get('grad_norm', '?')} "
             f"lr={metrics.get('lr', '?')}"
         ),
         (
-            "implied_action_loss="
-            f"{metrics.get('implied_action_loss', '?')} "
-            f"baseline={metrics.get('implied_baseline_action_loss', '?')} "
-            f"gap={metrics.get('implied_action_loss_gap', '?')}"
+            "q_terms="
+            f"seq={metrics.get('q_seq', '?')} "
+            f"delta={metrics.get('q_delta', '?')} "
+            f"g_seq={metrics.get('g_seq', '?')} "
+            f"g_delta={metrics.get('g_delta', '?')}"
         ),
         (
-            "compute_penalty="
-            f"{metrics.get('compute_penalty', '?')} "
-            f"baseline={metrics.get('baseline_compute_penalty', '?')} "
-            f"gap={metrics.get('compute_penalty_gap', '?')}"
+            "loss_terms="
+            f"l_seq(cur/lo/hi)="
+            f"{metrics.get('l_seq_cur', '?')}/"
+            f"{metrics.get('l_seq_lo', '?')}/"
+            f"{metrics.get('l_seq_hi', '?')} "
+            f"l_delta(cur/lo/hi)="
+            f"{metrics.get('l_delta_cur', '?')}/"
+            f"{metrics.get('l_delta_lo', '?')}/"
+            f"{metrics.get('l_delta_hi', '?')}"
         ),
         f"latest_checkpoint={status.get('latest_checkpoint')}",
         f"rank0_log={run_dir / 'logs' / 'train_rank0.log'}",

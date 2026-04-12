@@ -29,6 +29,7 @@ from wan_va.modules.utils import load_transformer
 from wan_va.configs import VA_CONFIGS
 from wan_va.utils.hazard_rollout_inputs import prepare_chunked_rollout_inputs
 from wan_va.utils.hazard_runtime import HazardRolloutRunner
+from wan_va.utils.hazard_reward import DualAnchorRewardEvaluator
 from wan_va.dataset.lerobot_latent_dataset import MultiLatentLeRobotDataset
 from wan_va.utils import init_logger, logger
 from torch.utils.data import DataLoader, Subset
@@ -79,15 +80,10 @@ class HazardEvaluator:
         self.dtype = dtype
         self.val_loader = val_loader
 
-        # Evaluation settings
-        # Read from nested config: hazard.*
         hazard_config = getattr(config, 'hazard', None)
         if hazard_config is None:
-            # Fallback to top-level attributes
-            self.lambda_cost = getattr(config, 'lambda_cost', 0.1)
             self.baseline_Ks = getattr(config, 'baseline_Ks', [5, 10, 15, 20])
         else:
-            self.lambda_cost = getattr(hazard_config, 'lambda_cost', 0.1)
             self.baseline_Ks = getattr(hazard_config, 'baseline_Ks', [5, 10, 15, 20])
 
         # Rollout runner
@@ -98,13 +94,16 @@ class HazardEvaluator:
             device=device,
             dtype=dtype,
         )
+        self.reward_evaluator = DualAnchorRewardEvaluator(
+            config=config,
+            device=device,
+        )
 
         # Set to eval mode
         self.transformer.eval()
         self.scheduler_head.eval()
 
         logger.info("HazardEvaluator initialized")
-        logger.info(f"  Lambda cost: {self.lambda_cost}")
         logger.info(f"  Baseline Ks: {self.baseline_Ks}")
 
     def _prepare_rollout_inputs(self, batch):
@@ -128,46 +127,90 @@ class HazardEvaluator:
         rollout_inputs = self._prepare_rollout_inputs(batch)
 
         # Evaluate Hazard scheduler
-        trajectory, pred_action, reward = self.rollout_runner.rollout_single_sample(
+        hazard_result = self.rollout_runner.rollout_single_sample(
             video_noise=rollout_inputs['video_noise'],
             action_noise=rollout_inputs['action_noise'],
             text_emb=rollout_inputs['text_emb'],
-            gt_action=rollout_inputs['gt_action'],
-            gt_action_mask=rollout_inputs['gt_action_mask'],
             clean_history_latents=rollout_inputs['clean_history_latents'],
             clean_history_actions=rollout_inputs['clean_history_actions'],
             latent_cond=rollout_inputs['latent_cond'],
             action_cond=rollout_inputs['action_cond'],
             mode='eval',
         )
-
-        results = {
-            'hazard': {
-                'reward': reward,
-                'video_steps': len(trajectory),
-                'action_loss': -reward + self.lambda_cost * len(trajectory),
-            }
-        }
-
-        # Evaluate baselines
-        for K in self.baseline_Ks:
-            baseline_trajectory, baseline_pred_action, baseline_reward = self.rollout_runner.rollout_fixed_K(
+        anchor_lo_result = self.rollout_runner.rollout_fixed_K(
+            video_noise=rollout_inputs['video_noise'],
+            action_noise=rollout_inputs['action_noise'],
+            text_emb=rollout_inputs['text_emb'],
+            K=self.reward_evaluator.anchor_lo_k,
+            clean_history_latents=rollout_inputs['clean_history_latents'],
+            clean_history_actions=rollout_inputs['clean_history_actions'],
+            latent_cond=rollout_inputs['latent_cond'],
+            action_cond=rollout_inputs['action_cond'],
+        )
+        if self.reward_evaluator.anchor_hi_k == self.reward_evaluator.anchor_lo_k:
+            anchor_hi_result = anchor_lo_result
+        else:
+            anchor_hi_result = self.rollout_runner.rollout_fixed_K(
                 video_noise=rollout_inputs['video_noise'],
                 action_noise=rollout_inputs['action_noise'],
                 text_emb=rollout_inputs['text_emb'],
-                gt_action=rollout_inputs['gt_action'],
-                gt_action_mask=rollout_inputs['gt_action_mask'],
-                K=K,
+                K=self.reward_evaluator.anchor_hi_k,
                 clean_history_latents=rollout_inputs['clean_history_latents'],
                 clean_history_actions=rollout_inputs['clean_history_actions'],
                 latent_cond=rollout_inputs['latent_cond'],
                 action_cond=rollout_inputs['action_cond'],
             )
+        hazard_breakdown = self.reward_evaluator.evaluate(
+            current=hazard_result,
+            anchor_lo=anchor_lo_result,
+            anchor_hi=anchor_hi_result,
+            gt_action=rollout_inputs['gt_action'],
+            gt_action_mask=rollout_inputs['gt_action_mask'],
+        )
+
+        results = {
+            'hazard': {
+                'reward': hazard_breakdown.reward,
+                'quality': hazard_breakdown.quality,
+                'cost': hazard_breakdown.cost,
+                'video_steps': hazard_result.video_steps,
+                'l_seq': hazard_breakdown.l_seq_cur,
+                'l_delta': hazard_breakdown.l_delta_cur,
+            }
+        }
+
+        # Evaluate baselines
+        for K in self.baseline_Ks:
+            if K == anchor_lo_result.video_steps:
+                baseline_result = anchor_lo_result
+            elif K == anchor_hi_result.video_steps:
+                baseline_result = anchor_hi_result
+            else:
+                baseline_result = self.rollout_runner.rollout_fixed_K(
+                    video_noise=rollout_inputs['video_noise'],
+                    action_noise=rollout_inputs['action_noise'],
+                    text_emb=rollout_inputs['text_emb'],
+                    K=K,
+                    clean_history_latents=rollout_inputs['clean_history_latents'],
+                    clean_history_actions=rollout_inputs['clean_history_actions'],
+                    latent_cond=rollout_inputs['latent_cond'],
+                    action_cond=rollout_inputs['action_cond'],
+                )
+            baseline_breakdown = self.reward_evaluator.evaluate(
+                current=baseline_result,
+                anchor_lo=anchor_lo_result,
+                anchor_hi=anchor_hi_result,
+                gt_action=rollout_inputs['gt_action'],
+                gt_action_mask=rollout_inputs['gt_action_mask'],
+            )
 
             results[f'baseline_K{K}'] = {
-                'reward': baseline_reward,
-                'video_steps': K,
-                'action_loss': -baseline_reward + self.lambda_cost * K,
+                'reward': baseline_breakdown.reward,
+                'quality': baseline_breakdown.quality,
+                'cost': baseline_breakdown.cost,
+                'video_steps': baseline_result.video_steps,
+                'l_seq': baseline_breakdown.l_seq_cur,
+                'l_delta': baseline_breakdown.l_delta_cur,
             }
 
         return results
@@ -217,15 +260,24 @@ class HazardEvaluator:
         for method in method_names:
             rewards = [r[method]['reward'] for r in all_results]
             video_steps = [r[method]['video_steps'] for r in all_results]
-            action_losses = [r[method]['action_loss'] for r in all_results]
+            qualities = [r[method]['quality'] for r in all_results]
+            costs = [r[method]['cost'] for r in all_results]
+            seq_losses = [r[method]['l_seq'] for r in all_results]
+            delta_losses = [r[method]['l_delta'] for r in all_results]
 
             aggregated[method] = {
                 'reward_mean': sum(rewards) / len(rewards),
                 'reward_std': torch.tensor(rewards).std().item(),
+                'quality_mean': sum(qualities) / len(qualities),
+                'quality_std': torch.tensor(qualities).std().item(),
+                'cost_mean': sum(costs) / len(costs),
+                'cost_std': torch.tensor(costs).std().item(),
                 'video_steps_mean': sum(video_steps) / len(video_steps),
                 'video_steps_std': torch.tensor(video_steps).float().std().item(),
-                'action_loss_mean': sum(action_losses) / len(action_losses),
-                'action_loss_std': torch.tensor(action_losses).std().item(),
+                'l_seq_mean': sum(seq_losses) / len(seq_losses),
+                'l_seq_std': torch.tensor(seq_losses).std().item(),
+                'l_delta_mean': sum(delta_losses) / len(delta_losses),
+                'l_delta_std': torch.tensor(delta_losses).std().item(),
             }
 
         return aggregated
@@ -240,8 +292,11 @@ class HazardEvaluator:
         hazard = aggregated['hazard']
         logger.info(f"\nHazard Scheduler:")
         logger.info(f"  Reward:       {hazard['reward_mean']:.4f} ± {hazard['reward_std']:.4f}")
+        logger.info(f"  Quality:      {hazard['quality_mean']:.4f} ± {hazard['quality_std']:.4f}")
+        logger.info(f"  Cost:         {hazard['cost_mean']:.4f} ± {hazard['cost_std']:.4f}")
         logger.info(f"  Video Steps:  {hazard['video_steps_mean']:.2f} ± {hazard['video_steps_std']:.2f}")
-        logger.info(f"  Action Loss:  {hazard['action_loss_mean']:.4f} ± {hazard['action_loss_std']:.4f}")
+        logger.info(f"  L_seq:        {hazard['l_seq_mean']:.4f} ± {hazard['l_seq_std']:.4f}")
+        logger.info(f"  L_delta:      {hazard['l_delta_mean']:.4f} ± {hazard['l_delta_std']:.4f}")
 
         # Print baseline results
         logger.info(f"\nBaselines:")
@@ -251,7 +306,10 @@ class HazardEvaluator:
                 K = method.split('_K')[1]
                 logger.info(f"  K={K}:")
                 logger.info(f"    Reward:       {baseline['reward_mean']:.4f} ± {baseline['reward_std']:.4f}")
-                logger.info(f"    Action Loss:  {baseline['action_loss_mean']:.4f} ± {baseline['action_loss_std']:.4f}")
+                logger.info(f"    Quality:      {baseline['quality_mean']:.4f} ± {baseline['quality_std']:.4f}")
+                logger.info(f"    Cost:         {baseline['cost_mean']:.4f} ± {baseline['cost_std']:.4f}")
+                logger.info(f"    L_seq:        {baseline['l_seq_mean']:.4f} ± {baseline['l_seq_std']:.4f}")
+                logger.info(f"    L_delta:      {baseline['l_delta_mean']:.4f} ± {baseline['l_delta_std']:.4f}")
 
         # Compute improvement over best baseline
         # Reward is defined as: R = -L_act - lambda_cost * K

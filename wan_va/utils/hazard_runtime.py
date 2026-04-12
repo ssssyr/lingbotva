@@ -4,18 +4,18 @@
 Hazard-based rollout runtime for adaptive video denoising.
 
 This module provides the runtime infrastructure for executing rollouts with
-HazardScheduler, including video denoising, stop decisions, handoff to action
-branch, and reward computation.
+HazardScheduler, including video denoising, stop decisions, and handoff to the
+action branch.
 """
 
 from typing import Dict, List, Tuple, Optional
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 
 from .scheduler import FlowMatchScheduler
 from .utils import data_seq_to_patch, get_mesh_id
+from .hazard_reward import RolloutResult
 from ..modules.hazard_scheduler import HazardScheduler, HazardSchedulerHead
 
 
@@ -28,7 +28,6 @@ class HazardRolloutRunner:
     2. HazardScheduler decision-making
     3. Handoff to action branch
     4. Action generation
-    5. Reward computation
     """
 
     def __init__(
@@ -115,11 +114,9 @@ class HazardRolloutRunner:
             # Fallback to top-level attributes
             self.K_min = int(getattr(config, 'hazard_k_min', 3))
             self.eta = float(getattr(config, 'hazard_eta', 0.5))
-            self.lambda_cost = float(getattr(config, 'lambda_cost', 0.1))
         else:
             self.K_min = int(getattr(hazard_config, 'K_min', 3))
             self.eta = float(getattr(hazard_config, 'eta', 0.5))
-            self.lambda_cost = float(getattr(hazard_config, 'lambda_cost', 0.1))
         self.K_min = max(0, min(int(self.K_min), self.K_max - 1))
 
         # Set transformer to eval mode
@@ -250,14 +247,12 @@ class HazardRolloutRunner:
         video_noise: torch.Tensor,
         action_noise: torch.Tensor,
         text_emb: torch.Tensor,
-        gt_action: torch.Tensor,
-        gt_action_mask: Optional[torch.Tensor] = None,
         clean_history_latents: Optional[torch.Tensor] = None,
         clean_history_actions: Optional[torch.Tensor] = None,
         latent_cond: Optional[torch.Tensor] = None,
         action_cond: Optional[torch.Tensor] = None,
         mode: str = 'train',
-    ) -> Tuple[List[Dict], torch.Tensor, float]:
+    ) -> RolloutResult:
         """
         Execute a single rollout with HazardScheduler.
 
@@ -265,16 +260,13 @@ class HazardRolloutRunner:
             video_noise: [B, C, F, H, W] initial video noise
             action_noise: [B, A, F, N, 1] initial action noise
             text_emb: [B, L, D] text embeddings
-            gt_action: [B, A, F, N, 1] ground truth actions for reward
-            gt_action_mask: [B, A, F, N, 1] valid action mask for reward
             latent_cond: [B, C, 1, H, W] optional conditioning frame
             action_cond: [B, A, 1, N, 1] optional conditioning action frame
             mode: 'train' (stochastic) or 'eval' (deterministic)
 
         Returns:
-            trajectory: List of dicts with step info (delta_H_k, h_k, log_prob, etc.)
-            final_action: [B, A, F, N, 1] predicted actions
-            reward: scalar reward value
+            RolloutResult containing the trajectory, predicted actions, and
+            rollout metadata.
         """
         if video_noise.shape[0] != 1:
             raise ValueError(
@@ -385,15 +377,21 @@ class HazardRolloutRunner:
                 frame_st_id=chunk_frame_st_id,
             )
 
-        # Compute reward (no gradients needed)
-        reward = self._compute_reward(
-            final_action,
-            gt_action,
-            stop_step,
-            gt_action_mask=gt_action_mask,
-        )
+        final_hazard = trajectory[-1]['H_cumulative'] if trajectory else 0.0
+        if isinstance(final_hazard, torch.Tensor):
+            final_hazard = float(final_hazard.detach().float().mean().item())
+        final_stop_prob = trajectory[-1]['h_k'] if trajectory else 0.0
+        if isinstance(final_stop_prob, torch.Tensor):
+            final_stop_prob = float(final_stop_prob.detach().float().mean().item())
 
-        return trajectory, final_action, reward
+        return RolloutResult(
+            trajectory=trajectory,
+            final_action=final_action,
+            video_steps=stop_step,
+            stop_step=stop_step,
+            final_hazard=float(final_hazard),
+            final_stop_prob=float(final_stop_prob),
+        )
 
     def _refresh_video_cache_exact(self, latents, text_emb, latent_cond, cutoff_idx, frame_st_id=0):
         """Refresh video cache at the cutoff point."""
@@ -457,44 +455,17 @@ class HazardRolloutRunner:
         actions[:, ~self.action_mask] *= 0
         return actions
 
-    def _compute_reward(self, pred_action, gt_action, video_steps, gt_action_mask=None):
-        """
-        Compute reward: R = -L_act - lambda_cost * video_steps
-
-        Args:
-            pred_action: [B, A, F, N, 1] predicted actions
-            gt_action: [B, A, F, N, 1] ground truth actions
-            video_steps: number of video denoising steps used
-            gt_action_mask: [B, A, F, N, 1] valid action mask
-
-        Returns:
-            reward: scalar reward value
-        """
-        if gt_action_mask is None:
-            L_act = F.mse_loss(pred_action.float(), gt_action.float())
-        else:
-            mask = gt_action_mask.float()
-            denom = mask.sum().clamp_min(1.0)
-            L_act = ((pred_action.float() - gt_action.float()) ** 2 * mask).sum() / denom
-
-        # Compute reward
-        reward = -L_act.item() - self.lambda_cost * video_steps
-
-        return reward
-
     def rollout_fixed_K(
         self,
         video_noise: torch.Tensor,
         action_noise: torch.Tensor,
         text_emb: torch.Tensor,
-        gt_action: torch.Tensor,
         K: int,
-        gt_action_mask: Optional[torch.Tensor] = None,
         clean_history_latents: Optional[torch.Tensor] = None,
         clean_history_actions: Optional[torch.Tensor] = None,
         latent_cond: Optional[torch.Tensor] = None,
         action_cond: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[Dict], torch.Tensor, float]:
+    ) -> RolloutResult:
         """
         Execute rollout with fixed K steps (for baseline comparison).
 
@@ -502,22 +473,19 @@ class HazardRolloutRunner:
             video_noise: [B, C, F, H, W] initial video noise
             action_noise: [B, A, F, N, 1] initial action noise
             text_emb: [B, L, D] text embeddings
-            gt_action: [B, A, F, N, 1] ground truth actions
-            gt_action_mask: [B, A, F, N, 1] valid action mask for reward
             K: fixed number of video steps
             latent_cond: [B, C, 1, H, W] optional conditioning frame
             action_cond: [B, A, 1, N, 1] optional conditioning action frame
 
         Returns:
-            trajectory: Empty list (no scheduler decisions)
-            final_action: [B, A, F, N, 1] predicted actions
-            reward: scalar reward value
+            RolloutResult containing the fixed-K rollout outputs.
         """
         if video_noise.shape[0] != 1:
             raise ValueError(
                 "HazardRolloutRunner V1 currently only supports batch_size=1 "
                 f"(got {video_noise.shape[0]})."
             )
+        K = max(0, min(int(K), self.num_video_steps))
 
         # Initialize cache
         self._init_cache(video_noise, action_noise)
@@ -582,12 +550,11 @@ class HazardRolloutRunner:
                 frame_st_id=chunk_frame_st_id,
             )
 
-        # Compute reward
-        reward = self._compute_reward(
-            final_action,
-            gt_action,
-            K,
-            gt_action_mask=gt_action_mask,
+        return RolloutResult(
+            trajectory=[],
+            final_action=final_action,
+            video_steps=K,
+            stop_step=K,
+            final_hazard=None,
+            final_stop_prob=None,
         )
-
-        return [], final_action, reward

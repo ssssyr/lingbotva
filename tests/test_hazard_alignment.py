@@ -114,16 +114,15 @@ def test_rollout_without_history_keeps_first_chunk_conditioning():
     latent_cond = torch.full((1, 1, 1, 1, 1), 9.0)
     action_cond = torch.zeros((1, 2, 1, 3, 1))
 
-    _, final_action, _ = runner.rollout_fixed_K(
+    result = runner.rollout_fixed_K(
         video_noise=video_noise,
         action_noise=action_noise,
         text_emb=text_emb,
-        gt_action=gt_action,
-        gt_action_mask=torch.ones_like(gt_action, dtype=torch.bool),
         K=1,
         latent_cond=latent_cond,
         action_cond=action_cond,
     )
+    final_action = result.final_action
 
     video_calls = [c for c in transformer.calls if not c["action_mode"] and c["update_cache"] == 0]
     action_calls = [c for c in transformer.calls if c["action_mode"] and c["update_cache"] == 0]
@@ -142,18 +141,17 @@ def test_rollout_with_history_skips_first_frame_conditioning():
     clean_history_latents = torch.ones((1, 1, 2, 1, 1))
     clean_history_actions = torch.ones((1, 2, 2, 3, 1))
 
-    _, final_action, _ = runner.rollout_fixed_K(
+    result = runner.rollout_fixed_K(
         video_noise=video_noise,
         action_noise=action_noise,
         text_emb=text_emb,
-        gt_action=gt_action,
-        gt_action_mask=torch.ones_like(gt_action, dtype=torch.bool),
         K=1,
         clean_history_latents=clean_history_latents,
         clean_history_actions=clean_history_actions,
         latent_cond=None,
         action_cond=None,
     )
+    final_action = result.final_action
 
     video_calls = [c for c in transformer.calls if not c["action_mode"] and c["update_cache"] == 0]
     action_calls = [c for c in transformer.calls if c["action_mode"] and c["update_cache"] == 0]
@@ -163,22 +161,22 @@ def test_rollout_with_history_skips_first_frame_conditioning():
     assert torch.allclose(final_action[:, :, 0:1], action_noise[:, :, 0:1])
 
 
-def test_reward_uses_action_mask():
+def test_rollout_fixed_k_returns_metadata():
     runner, _ = make_runner()
-    pred_action = torch.zeros((1, 2, 1, 1, 1), dtype=torch.float32)
-    gt_action = torch.zeros_like(pred_action)
-    gt_action[:, 1] = 1.0
-    gt_action_mask = torch.zeros_like(pred_action, dtype=torch.bool)
-    gt_action_mask[:, 0] = True
+    video_noise = torch.zeros((1, 1, 2, 1, 1), dtype=torch.float32)
+    action_noise = torch.zeros((1, 2, 2, 3, 1), dtype=torch.float32)
+    text_emb = torch.zeros((1, 4, 4), dtype=torch.float32)
 
-    reward = runner._compute_reward(
-        pred_action=pred_action,
-        gt_action=gt_action,
-        gt_action_mask=gt_action_mask,
-        video_steps=3,
+    result = runner.rollout_fixed_K(
+        video_noise=video_noise,
+        action_noise=action_noise,
+        text_emb=text_emb,
+        K=2,
     )
 
-    assert abs(reward + 0.3) < 1e-6
+    assert result.video_steps == 2
+    assert result.stop_step == 2
+    assert result.final_action.shape == action_noise.shape
 
 
 def test_prepare_rollout_inputs_for_eval_prefills_one_history_chunk():
