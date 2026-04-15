@@ -10,14 +10,15 @@ adaptive video denoising schedules using the REINFORCE algorithm.
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
+import torch.nn.functional as F
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
-from ..modules.hazard_scheduler import HazardSchedulerHead
+from ..modules.hazard_scheduler import HazardJumpSchedulerHead, HazardSchedulerHead
 from .hazard_rollout_inputs import prepare_chunked_rollout_inputs
 from .hazard_runtime import HazardRolloutRunner
 from .hazard_reward import DualAnchorRewardEvaluator
@@ -107,9 +108,23 @@ class HazardTrainer:
             self.log_interval = int(getattr(hazard_config, 'log_interval', 10))
             self.reward_baseline_mode = str(getattr(hazard_config, 'reward_adv_baseline', 'ema')).lower()
             self.reward_ema_decay = float(getattr(hazard_config, 'reward_ema_decay', 0.95))
+        self.policy_variant = str(getattr(hazard_config, "policy_variant", "stop_only_v1") if hazard_config is not None else getattr(config, "hazard_policy_variant", "stop_only_v1")).lower()
+        self.optimizer_mode = str(getattr(hazard_config, "optimizer_mode", "reinforce") if hazard_config is not None else "reinforce").lower()
+        self.ppo_num_epochs = int(getattr(hazard_config, "ppo_num_epochs", 4) if hazard_config is not None else 4)
+        self.cliprange = float(getattr(hazard_config, "cliprange", 0.2) if hazard_config is not None else 0.2)
+        self.jump_logprob_scale = float(getattr(hazard_config, "jump_logprob_scale", 1.0) if hazard_config is not None else 1.0)
+        self.advantage_normalize = bool(getattr(hazard_config, "advantage_normalize", False) if hazard_config is not None else False)
+        self.jump_ref_concentration = float(getattr(hazard_config, "jump_ref_concentration", 20.0) if hazard_config is not None else 20.0)
 
         # Read gradient_accumulation_steps from training config
         self.gradient_accumulation_steps = int(getattr(config.training, 'gradient_accumulation_steps', 1))
+        if self.optimizer_mode == "ppo" and self.gradient_accumulation_steps != 1:
+            logger.warning(
+                "optimizer_mode=ppo currently runs one optimizer step per sampled rollout; "
+                "overriding gradient_accumulation_steps from %s to 1",
+                self.gradient_accumulation_steps,
+            )
+            self.gradient_accumulation_steps = 1
 
         # Optimizer for scheduler_head only
         self.optimizer = torch.optim.AdamW(
@@ -160,6 +175,8 @@ class HazardTrainer:
         logger.info(f"  Reward anchors: lo={self.reward_evaluator.anchor_lo_k} hi={self.reward_evaluator.anchor_hi_k}")
         logger.info(f"  KL reference K: {self.kl_reference_K}")
         logger.info(f"  Reward baseline mode: {self.reward_baseline_mode}")
+        logger.info(f"  Policy variant: {self.policy_variant}")
+        logger.info(f"  Optimizer mode: {self.optimizer_mode}")
         logger.info(f"  Max steps: {self.max_steps}")
 
     def _get_next_batch(self):
@@ -279,6 +296,86 @@ class HazardTrainer:
         )
         return baseline
 
+    def _normalize_advantage(self, advantage: float) -> float:
+        # With batch_size=1 this is a no-op, but keep the hook for future
+        # multi-rollout / RLOO variants.
+        return float(advantage)
+
+    def _trajectory_old_logprob(self, trajectory) -> torch.Tensor:
+        old_logprob = torch.tensor(0.0, device=self.device)
+        for step_info in trajectory:
+            if step_info.get("old_logprob", None) is not None:
+                old_logprob = old_logprob + step_info["old_logprob"].to(device=self.device)
+        return old_logprob
+
+    def _recompute_path_logprob(self, trajectory) -> torch.Tensor:
+        if not isinstance(self.scheduler_head, HazardJumpSchedulerHead):
+            raise TypeError("Path logprob recomputation is only supported for HazardJumpSchedulerHead")
+        logprob = torch.tensor(0.0, device=self.device)
+        for step_info in trajectory:
+            new_step_logprob = self.scheduler_head.recompute_step_logprob(
+                video_feature=step_info["video_feature"].to(device=self.device),
+                sigma_cur=float(step_info["sigma_cur"]),
+                stop_action=bool(step_info["stop_action"]),
+                sigma_next=step_info.get("sigma_next", None),
+                forced_stop=bool(step_info.get("forced_stop", False)),
+                forced_continue=bool(step_info.get("forced_continue", False)),
+                jump_logprob_scale=self.jump_logprob_scale,
+            )
+            if new_step_logprob is not None:
+                logprob = logprob + new_step_logprob
+        return logprob
+
+    def _reference_jump_beta(self, sigma_cur: float, device) -> Tuple[torch.Tensor, torch.Tensor]:
+        sigmas = self.rollout_runner.video_scheduler.sigmas.float()
+        sigma_cur_tensor = torch.tensor(float(sigma_cur), dtype=torch.float32)
+        idx = int(torch.argmin((sigmas - sigma_cur_tensor).abs()).item())
+        idx = max(0, min(idx, len(sigmas) - 2))
+        ref_ratio = torch.clamp(sigmas[idx + 1] / torch.clamp(sigmas[idx], min=1e-6), 1e-3, 1.0 - 1e-3)
+        concentration = float(self.jump_ref_concentration)
+        alpha_ref = ref_ratio * (concentration - 2.0) + 1.0
+        beta_ref = (1.0 - ref_ratio) * (concentration - 2.0) + 1.0
+        return (
+            torch.tensor([alpha_ref], dtype=torch.float32, device=device),
+            torch.tensor([beta_ref], dtype=torch.float32, device=device),
+        )
+
+    def _compute_kl_regularization_v2(self, trajectory) -> torch.Tensor:
+        if len(trajectory) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        eps = 1e-6
+        stop_kl_sum = torch.tensor(0.0, device=self.device)
+        jump_kl_sum = torch.tensor(0.0, device=self.device)
+        jump_terms = 0
+        stop_terms = 0
+        reference_stop_idx = max(int(self.kl_reference_K) - 1, 0)
+
+        for step_info in trajectory:
+            feature = step_info["video_feature"].to(device=self.device)
+            sigma_cur = float(step_info["sigma_cur"])
+            outputs = self.scheduler_head(feature, sigma_cur=sigma_cur)
+            if not step_info.get("forced_stop", False) and not step_info.get("forced_continue", False):
+                h_k = torch.clamp(outputs.h_k, 1e-6, 1.0 - 1e-6)
+                reference_prob = eps if int(step_info["step_idx"]) < reference_stop_idx else 1.0 - eps
+                h_ref_k = torch.full_like(h_k, reference_prob)
+                stop_kl = h_k * torch.log(h_k / h_ref_k) + (1 - h_k) * torch.log((1 - h_k) / (1 - h_ref_k))
+                stop_kl_sum = stop_kl_sum + stop_kl.mean()
+                stop_terms += 1
+
+            if step_info.get("sigma_next", None) is not None:
+                alpha_ref, beta_ref = self._reference_jump_beta(sigma_cur, feature.device)
+                jump_kl = torch.distributions.kl_divergence(
+                    torch.distributions.Beta(outputs.alpha_k.squeeze(-1), outputs.beta_k.squeeze(-1)),
+                    torch.distributions.Beta(alpha_ref, beta_ref),
+                )
+                jump_kl_sum = jump_kl_sum + jump_kl.mean()
+                jump_terms += 1
+
+        stop_kl_mean = stop_kl_sum / max(stop_terms, 1)
+        jump_kl_mean = jump_kl_sum / max(jump_terms, 1)
+        return stop_kl_mean + jump_kl_mean
+
     def _sync_scheduler_gradients(self) -> None:
         if not dist.is_initialized():
             return
@@ -358,45 +455,108 @@ class HazardTrainer:
         baseline_reward = self._get_advantage_baseline(reward)
         advantage = reward - baseline_reward
 
-        # Compute policy gradient loss
-        # REINFORCE: L = -sum(log_prob * advantage)
-        policy_loss = 0.0
-        for step_info in trajectory:
-            if step_info['log_prob'] is not None:
-                # log_prob should have gradients, advantage is detached
-                policy_loss += -step_info['log_prob'] * advantage
+        if self.advantage_normalize:
+            advantage = self._normalize_advantage(advantage)
 
-        policy_loss = policy_loss / max(len(trajectory), 1)
-
-        kl_loss = self._compute_kl_regularization(trajectory)
-
-        # Total loss
-        total_loss = policy_loss + self.lambda_kl * kl_loss
-        total_loss = total_loss / self.gradient_accumulation_steps
-
-        # Backward
-        total_loss.backward()
-
-        # Optimizer step (if accumulation is done)
-        should_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
         grad_norm = 0.0
         lr = self.optimizer.param_groups[0]["lr"]
-        if should_step:
-            self._sync_scheduler_gradients()
-            # Gradient clipping
-            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(self.scheduler_head.parameters(), max_norm=1.0)
-            grad_norm = float(grad_norm_tensor.item())
-            if torch.isfinite(torch.tensor(grad_norm)):
-                self.optimizer.step()
-            else:
-                logger.warning("Non-finite grad_norm detected at step=%s micro_step=%s; skipping optimizer step", self.step, self.micro_step)
+        approxkl = 0.0
+        clipfrac = 0.0
+        ratio_mean = 1.0
+        policy_loss_value = 0.0
+        kl_loss_value = 0.0
+        total_loss_value = 0.0
+
+        if self.optimizer_mode == "ppo" and isinstance(self.scheduler_head, HazardJumpSchedulerHead):
+            should_step = True
+            old_logprob = self._trajectory_old_logprob(trajectory).detach()
             self.optimizer.zero_grad(set_to_none=True)
+            policy_loss_terms = []
+            kl_loss_terms = []
+            approxkl_terms = []
+            clipfrac_terms = []
+            ratio_terms = []
+            grad_norm_terms = []
+
+            for _ in range(self.ppo_num_epochs):
+                new_logprob = self._recompute_path_logprob(trajectory)
+                logprobs_diff = new_logprob - old_logprob
+                ratio = torch.exp(logprobs_diff)
+                unclipped = -float(advantage) * ratio
+                clipped = -float(advantage) * torch.clamp(ratio, 1.0 - self.cliprange, 1.0 + self.cliprange)
+                policy_loss = torch.max(unclipped, clipped)
+                kl_loss = self._compute_kl_regularization_v2(trajectory)
+                total_loss = policy_loss + self.lambda_kl * kl_loss
+
+                self.optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                self._sync_scheduler_gradients()
+                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(self.scheduler_head.parameters(), max_norm=1.0)
+                grad_norm_epoch = float(grad_norm_tensor.item())
+                if torch.isfinite(torch.tensor(grad_norm_epoch)):
+                    self.optimizer.step()
+                else:
+                    logger.warning(
+                        "Non-finite grad_norm detected at step=%s micro_step=%s during PPO; skipping optimizer step",
+                        self.step,
+                        self.micro_step,
+                    )
+
+                policy_loss_terms.append(float(policy_loss.item()))
+                kl_loss_terms.append(float(kl_loss.item()))
+                approxkl_terms.append(float((0.5 * (logprobs_diff ** 2)).item()))
+                clipfrac_terms.append(float((clipped > unclipped).float().item()))
+                ratio_terms.append(float(ratio.item()))
+                grad_norm_terms.append(grad_norm_epoch)
+
+            policy_loss_value = sum(policy_loss_terms) / max(len(policy_loss_terms), 1)
+            kl_loss_value = sum(kl_loss_terms) / max(len(kl_loss_terms), 1)
+            total_loss_value = (policy_loss_value + self.lambda_kl * kl_loss_value)
+            approxkl = sum(approxkl_terms) / max(len(approxkl_terms), 1)
+            clipfrac = sum(clipfrac_terms) / max(len(clipfrac_terms), 1)
+            ratio_mean = sum(ratio_terms) / max(len(ratio_terms), 1)
+            grad_norm = sum(grad_norm_terms) / max(len(grad_norm_terms), 1)
+        else:
+            # Compute policy gradient loss
+            # REINFORCE: L = -sum(log_prob * advantage)
+            policy_loss = torch.tensor(0.0, device=self.device)
+            for step_info in trajectory:
+                if step_info['log_prob'] is not None:
+                    policy_loss = policy_loss + (-step_info['log_prob'] * float(advantage))
+
+            policy_loss = policy_loss / max(len(trajectory), 1)
+            if isinstance(self.scheduler_head, HazardJumpSchedulerHead):
+                kl_loss = self._compute_kl_regularization_v2(trajectory)
+            else:
+                kl_loss = self._compute_kl_regularization(trajectory)
+
+            total_loss = policy_loss + self.lambda_kl * kl_loss
+            total_loss = total_loss / self.gradient_accumulation_steps
+            total_loss.backward()
+
+            should_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+            if should_step:
+                self._sync_scheduler_gradients()
+                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(self.scheduler_head.parameters(), max_norm=1.0)
+                grad_norm = float(grad_norm_tensor.item())
+                if torch.isfinite(torch.tensor(grad_norm)):
+                    self.optimizer.step()
+                else:
+                    logger.warning(
+                        "Non-finite grad_norm detected at step=%s micro_step=%s; skipping optimizer step",
+                        self.step,
+                        self.micro_step,
+                    )
+                self.optimizer.zero_grad(set_to_none=True)
+            policy_loss_value = float(policy_loss.item() * self.gradient_accumulation_steps)
+            kl_loss_value = float(kl_loss.item())
+            total_loss_value = float(total_loss.item() * self.gradient_accumulation_steps)
 
         # Metrics
         metrics = {
-            'policy_loss': policy_loss.item() * self.gradient_accumulation_steps,
-            'kl_loss': kl_loss.item(),
-            'total_loss': total_loss.item() * self.gradient_accumulation_steps,
+            'policy_loss': policy_loss_value,
+            'kl_loss': kl_loss_value,
+            'total_loss': total_loss_value,
             'reward': reward,
             'baseline_reward': baseline_reward,
             'advantage': advantage,
@@ -416,7 +576,10 @@ class HazardTrainer:
             'g_delta': reward_breakdown.g_delta,
             'd_seq': reward_breakdown.d_seq,
             'd_delta': reward_breakdown.d_delta,
-            'video_steps': current_result.video_steps,
+            'video_steps': current_result.executed_video_steps,
+            'equivalent_fixed_steps': float(current_result.equivalent_fixed_steps or current_result.video_steps),
+            'terminal_sigma': float(current_result.terminal_sigma) if current_result.terminal_sigma is not None else -1.0,
+            'jump_distance_mean': float(sum(v for v in (current_result.jump_distance_history or []) if v is not None) / max(1, len([v for v in (current_result.jump_distance_history or []) if v is not None]))) if current_result.jump_distance_history else 0.0,
             'anchor_lo_steps': anchor_lo_result.video_steps,
             'anchor_hi_steps': anchor_hi_result.video_steps,
             'step_time': time.perf_counter() - step_t0,
@@ -424,6 +587,9 @@ class HazardTrainer:
             'lr': lr,
             'should_step': should_step,
             'ema_baseline': float(self.reward_baseline_value if self.reward_baseline_value is not None else baseline_reward),
+            'approxkl': approxkl,
+            'clipfrac': clipfrac,
+            'ratio_mean': ratio_mean,
         }
 
         return metrics
@@ -472,6 +638,7 @@ class HazardTrainer:
                     reward=f"{reduced_metrics['reward']:.4f}",
                     quality=f"{reduced_metrics['quality']:.4f}",
                     steps=f"{reduced_metrics['video_steps']:.2f}",
+                    eq=f"{reduced_metrics.get('equivalent_fixed_steps', 0.0):.2f}",
                     grad=f"{reduced_metrics['grad_norm']:.2f}",
                 )
 
@@ -495,8 +662,12 @@ class HazardTrainer:
                         f"Adv: {reduced_metrics['advantage']:.4f} | "
                         f"Q(seq={reduced_metrics['q_seq']:.4f}, delta={reduced_metrics['q_delta']:.4f}) | "
                         f"Steps: cur={reduced_metrics['video_steps']:.2f} "
+                        f"eq={reduced_metrics.get('equivalent_fixed_steps', 0.0):.2f} "
                         f"lo={reduced_metrics['anchor_lo_steps']:.2f} "
                         f"hi={reduced_metrics['anchor_hi_steps']:.2f} | "
+                        f"Sigma: {reduced_metrics.get('terminal_sigma', -1.0):.4f} | "
+                        f"JumpDist: {reduced_metrics.get('jump_distance_mean', 0.0):.4f} | "
+                        f"PPO(r={reduced_metrics.get('ratio_mean', 1.0):.4f}, kl={reduced_metrics.get('approxkl', 0.0):.4f}, clip={reduced_metrics.get('clipfrac', 0.0):.4f}) | "
                         f"GradNorm: {reduced_metrics['grad_norm']:.2f} | "
                         f"LR: {reduced_metrics['lr']:.2e} | "
                         f"StepTime(max): {reduced_metrics['step_time']:.2f}s"
@@ -545,6 +716,9 @@ class HazardTrainer:
         scheduler_head = self._unwrap_scheduler_head(self.scheduler_head)
         checkpoint = {
             'step': self.step,
+            'schema_version': 'hazard_scheduler_v2' if self.policy_variant == 'stop_jump_v2' else 'hazard_scheduler_v1',
+            'policy_variant': self.policy_variant,
+            'optimizer_mode': self.optimizer_mode,
             'scheduler_head_state_dict': scheduler_head.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': _to_plain_python(dict(self.config)),

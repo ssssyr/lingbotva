@@ -15,6 +15,20 @@ class RolloutResult:
     stop_step: int
     final_hazard: Optional[float] = None
     final_stop_prob: Optional[float] = None
+    executed_video_steps: Optional[int] = None
+    equivalent_fixed_steps: Optional[float] = None
+    terminal_sigma: Optional[float] = None
+    sigma_cur_history: Optional[List[float]] = None
+    sigma_next_history: Optional[List[Optional[float]]] = None
+    jump_ratio_history: Optional[List[Optional[float]]] = None
+    jump_distance_history: Optional[List[Optional[float]]] = None
+    path_logprob: Optional[float] = None
+
+    def __post_init__(self):
+        if self.executed_video_steps is None:
+            self.executed_video_steps = int(self.video_steps)
+        if self.video_steps is None:
+            self.video_steps = int(self.executed_video_steps)
 
 
 @dataclass

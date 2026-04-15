@@ -46,18 +46,33 @@ training:
   gc_interval: 50
   cfg_prob: 0.0  # No CFG during Hazard training
   batch_size: 1  # CRITICAL: Must be 1 for current HazardScheduler (per-sample rollout)
-  gradient_accumulation_steps: 4  # Effective batch size = 4
+  gradient_accumulation_steps: 1
   num_steps: 10000
 
 # Hazard-specific training config
 hazard:
+  baseline_Ks: [5, 10, 15, 20, 25]
+  policy_variant: stop_jump_v2
+  optimizer_mode: ppo
   learning_rate: 1e-4
   lambda_cost: 0.1  # Cost penalty for video steps
   lambda_kl: 0.01  # KL regularization
   baseline_K: 10  # Fixed K for baseline
   kl_reference_K: 25
   K_min: 3  # Minimum steps before allowing stop
-  eta: 0.5  # Stopping threshold for deterministic inference
+  eta: 0.8  # Stopping threshold for deterministic inference
+  sigma_min: 0.01
+  jump_parameterization: mode_concentration
+  jump_relative: true
+  jump_ref_concentration: 20.0
+  heuristic_jump_mode: 0.75
+  heuristic_jump_concentration: 10.0
+  ppo_num_epochs: 4
+  cliprange: 0.2
+  jump_logprob_scale: 0.3
+  advantage_normalize: true
+  rloo_k: 1
+  use_rloo: false
   reward_adv_baseline: ema
   reward_ema_decay: 0.95
   reward_anchor_lo_k: 4
@@ -80,7 +95,7 @@ hazard:
   reward_time_eta_gripper: 1.2
   reward_time_eta_early: 0.0
   reward_cost_c0: 0.2
-  reward_cost_c1: 0.8
+  reward_cost_c1: 0.0
   reward_cost_gamma: 2.0
   log_interval: 10
   save_interval: 1000

@@ -37,7 +37,7 @@ from utils import (
     save_async,
 )
 from utils.hazard_loader import load_hazard_scheduler_head
-from modules.hazard_scheduler import HazardScheduler
+from modules.hazard_scheduler import HazardJumpScheduler, HazardJumpSchedulerHead, HazardScheduler
 
 
 class VA_Server:
@@ -125,10 +125,14 @@ class VA_Server:
         )
         self.hazard_scheduler_head = scheduler_head
         self.hazard_checkpoint_step = int(checkpoint.get("step", -1))
+        self.hazard_policy_variant = str(
+            checkpoint.get("policy_variant", getattr(self.job_config, "hazard_policy_variant", "stop_only_v1"))
+        ).lower()
         logger.info(
-            "Hazard runtime enabled: checkpoint=%s step=%s K_max=%s K_min=%s eta=%s feature_source=%s",
+            "Hazard runtime enabled: checkpoint=%s step=%s variant=%s K_max=%s K_min=%s eta=%s feature_source=%s",
             checkpoint_path,
             self.hazard_checkpoint_step,
+            self.hazard_policy_variant,
             getattr(self.job_config, "hazard_K_max", getattr(self.job_config, "num_inference_steps", None)),
             getattr(self.job_config, "hazard_K_min", None),
             getattr(self.job_config, "hazard_eta", None),
@@ -692,6 +696,14 @@ class VA_Server:
         return latents, scheduler_meta
 
     def _run_hazard_video_loop(self, latents, video_timesteps, padded_video_timesteps, frame_chunk_size, frame_st_id=0):
+        if getattr(self, "hazard_policy_variant", "stop_only_v1") == "stop_jump_v2" or isinstance(self.hazard_scheduler_head, HazardJumpSchedulerHead):
+            return self._run_hazard_jump_video_loop(
+                latents,
+                video_timesteps,
+                padded_video_timesteps,
+                frame_chunk_size,
+                frame_st_id=frame_st_id,
+            )
         self._sync_device()
         video_t0 = time.perf_counter()
         if self.hazard_scheduler_head is None:
@@ -756,6 +768,100 @@ class VA_Server:
             "video_steps_used": video_steps_used,
             "video_steps_max": int(self.job_config.num_inference_steps),
             "video_steps_limit": int(hazard_k_max),
+            "hazard_eta": float(getattr(self.job_config, "hazard_eta", 0.5)),
+            "hazard_feature_source": str(getattr(self.job_config, "hazard_feature_source", "cond")),
+            "hazard_checkpoint_step": int(getattr(self, "hazard_checkpoint_step", -1)),
+            "hazard_h_cumulative": float(hazard_scheduler.H_cumulative),
+            "video_runtime_ms": (time.perf_counter() - video_t0) * 1000.0,
+        }
+        return latents, scheduler_meta
+
+    def _run_hazard_jump_video_loop(self, latents, video_timesteps, padded_video_timesteps, frame_chunk_size, frame_st_id=0):
+        self._sync_device()
+        video_t0 = time.perf_counter()
+        if self.hazard_scheduler_head is None:
+            raise RuntimeError("Hazard runtime is enabled but scheduler head is not loaded.")
+        if not isinstance(self.hazard_scheduler_head, HazardJumpSchedulerHead):
+            raise TypeError(
+                "stop_jump_v2 runtime requires HazardJumpSchedulerHead, "
+                f"got {type(self.hazard_scheduler_head).__name__}"
+            )
+
+        hazard_k_max = max(
+            1,
+            min(int(getattr(self.job_config, "hazard_K_max", len(video_timesteps))), len(video_timesteps)),
+        )
+        hazard_scheduler = HazardJumpScheduler(
+            scheduler_head=self.hazard_scheduler_head,
+            K_max=hazard_k_max,
+            K_min=int(getattr(self.job_config, "hazard_K_min", 3)),
+            eta=float(getattr(self.job_config, "hazard_eta", 0.5)),
+            sigma_min=float(getattr(self.job_config, "hazard_sigma_min", 0.01)),
+            jump_logprob_scale=float(getattr(self.job_config, "jump_logprob_scale", 1.0)),
+            mode='eval',
+        )
+        latent_cond = self._get_latent_cond(frame_st_id)
+        sigma_cur = float(self.scheduler.sigmas[0].item())
+        sigma_history = []
+        jump_ratio_history = []
+        jump_distance_history = []
+
+        for _step_idx in range(hazard_k_max):
+            t = self.scheduler.sigma_to_timestep(sigma_cur).to(device=self.device, dtype=torch.float32)
+            input_dict = self._prepare_latent_input(
+                latents,
+                None,
+                t,
+                t,
+                latent_cond,
+                None,
+                frame_st_id=frame_st_id,
+            )
+            video_noise_pred, video_pooled = self.transformer(
+                self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                update_cache=0,
+                cache_name=self.cache_name,
+                action_mode=False,
+                return_video_features=True,
+            )
+            video_noise_pred = self._apply_video_cfg(video_noise_pred, frame_chunk_size)
+            scheduler_result = hazard_scheduler.step(
+                self._select_hazard_video_feature(video_pooled).detach(),
+                sigma_cur=sigma_cur,
+            )
+            sigma_history.append(float(scheduler_result["sigma_cur"]))
+            if scheduler_result["jump_ratio"] is not None:
+                jump_ratio_history.append(float(scheduler_result["jump_ratio"].mean().item()))
+                jump_distance_history.append(float(scheduler_result["jump_distance"].mean().item()))
+            if scheduler_result["should_stop"]:
+                break
+
+            sigma_next = float(scheduler_result["sigma_next"])
+            latents = self.scheduler.custom_step(
+                video_noise_pred,
+                sigma_cur=sigma_cur,
+                sigma_next=sigma_next,
+                sample=latents,
+                return_dict=False,
+            )
+            if latent_cond is not None:
+                latents[:, :, 0:1] = latent_cond
+            sigma_cur = sigma_next
+
+        video_steps_used = int(hazard_scheduler.step_count)
+        terminal_sigma = float(sigma_history[-1]) if sigma_history else float(sigma_cur)
+        refresh_t = self.scheduler.sigma_to_timestep(terminal_sigma)
+        self._refresh_video_cache_exact(latents, refresh_t, frame_st_id=frame_st_id)
+        self._sync_device()
+        scheduler_meta = {
+            "mode": "hazard_jump_v2",
+            "video_steps_used": video_steps_used,
+            "video_steps_max": int(self.job_config.num_inference_steps),
+            "video_steps_limit": int(hazard_k_max),
+            "equivalent_fixed_steps": int(self.scheduler.approx_step_index(terminal_sigma) + 1),
+            "terminal_sigma": terminal_sigma,
+            "jump_ratio_history": jump_ratio_history,
+            "jump_distance_history": jump_distance_history,
             "hazard_eta": float(getattr(self.job_config, "hazard_eta", 0.5)),
             "hazard_feature_source": str(getattr(self.job_config, "hazard_feature_source", "cond")),
             "hazard_checkpoint_step": int(getattr(self, "hazard_checkpoint_step", -1)),

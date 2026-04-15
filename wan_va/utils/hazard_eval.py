@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 
+from __future__ import annotations
+
 """
 Offline evaluation script for Hazard scheduler.
 
@@ -24,9 +26,9 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from wan_va.modules.model import WanTransformer3DModel
-from wan_va.modules.hazard_scheduler import HazardSchedulerHead
 from wan_va.modules.utils import load_transformer
 from wan_va.configs import VA_CONFIGS
+from wan_va.utils.hazard_loader import load_hazard_scheduler_head
 from wan_va.utils.hazard_rollout_inputs import prepare_chunked_rollout_inputs
 from wan_va.utils.hazard_runtime import HazardRolloutRunner
 from wan_va.utils.hazard_reward import DualAnchorRewardEvaluator
@@ -61,7 +63,7 @@ class HazardEvaluator:
 
     Evaluates on validation set and compares:
     - Hazard scheduler (adaptive)
-    - Fixed K baselines (K=5, 10, 15, 20)
+    - Fixed K baselines (including K=25 full denoising)
     """
 
     def __init__(
@@ -82,9 +84,10 @@ class HazardEvaluator:
 
         hazard_config = getattr(config, 'hazard', None)
         if hazard_config is None:
-            self.baseline_Ks = getattr(config, 'baseline_Ks', [5, 10, 15, 20])
+            self.baseline_Ks = getattr(config, 'baseline_Ks', [5, 10, 15, 20, 25])
         else:
-            self.baseline_Ks = getattr(hazard_config, 'baseline_Ks', [5, 10, 15, 20])
+            self.baseline_Ks = getattr(hazard_config, 'baseline_Ks', [5, 10, 15, 20, 25])
+        self.baseline_Ks = sorted({int(k) for k in self.baseline_Ks})
 
         # Rollout runner
         self.rollout_runner = HazardRolloutRunner(
@@ -174,6 +177,13 @@ class HazardEvaluator:
                 'quality': hazard_breakdown.quality,
                 'cost': hazard_breakdown.cost,
                 'video_steps': hazard_result.video_steps,
+                'executed_video_steps': int(hazard_result.executed_video_steps or hazard_result.video_steps),
+                'equivalent_fixed_steps': float(
+                    hazard_result.equivalent_fixed_steps
+                    if hazard_result.equivalent_fixed_steps is not None
+                    else hazard_result.video_steps
+                ),
+                'terminal_sigma': float(hazard_result.terminal_sigma) if hazard_result.terminal_sigma is not None else -1.0,
                 'l_seq': hazard_breakdown.l_seq_cur,
                 'l_delta': hazard_breakdown.l_delta_cur,
             }
@@ -209,6 +219,13 @@ class HazardEvaluator:
                 'quality': baseline_breakdown.quality,
                 'cost': baseline_breakdown.cost,
                 'video_steps': baseline_result.video_steps,
+                'executed_video_steps': int(baseline_result.executed_video_steps or baseline_result.video_steps),
+                'equivalent_fixed_steps': float(
+                    baseline_result.equivalent_fixed_steps
+                    if baseline_result.equivalent_fixed_steps is not None
+                    else baseline_result.video_steps
+                ),
+                'terminal_sigma': float(baseline_result.terminal_sigma) if baseline_result.terminal_sigma is not None else -1.0,
                 'l_seq': baseline_breakdown.l_seq_cur,
                 'l_delta': baseline_breakdown.l_delta_cur,
             }
@@ -260,6 +277,9 @@ class HazardEvaluator:
         for method in method_names:
             rewards = [r[method]['reward'] for r in all_results]
             video_steps = [r[method]['video_steps'] for r in all_results]
+            executed_video_steps = [r[method]['executed_video_steps'] for r in all_results]
+            equivalent_fixed_steps = [r[method]['equivalent_fixed_steps'] for r in all_results]
+            terminal_sigmas = [r[method]['terminal_sigma'] for r in all_results]
             qualities = [r[method]['quality'] for r in all_results]
             costs = [r[method]['cost'] for r in all_results]
             seq_losses = [r[method]['l_seq'] for r in all_results]
@@ -274,6 +294,12 @@ class HazardEvaluator:
                 'cost_std': torch.tensor(costs).std().item(),
                 'video_steps_mean': sum(video_steps) / len(video_steps),
                 'video_steps_std': torch.tensor(video_steps).float().std().item(),
+                'executed_video_steps_mean': sum(executed_video_steps) / len(executed_video_steps),
+                'executed_video_steps_std': torch.tensor(executed_video_steps).float().std().item(),
+                'equivalent_fixed_steps_mean': sum(equivalent_fixed_steps) / len(equivalent_fixed_steps),
+                'equivalent_fixed_steps_std': torch.tensor(equivalent_fixed_steps).float().std().item(),
+                'terminal_sigma_mean': sum(terminal_sigmas) / len(terminal_sigmas),
+                'terminal_sigma_std': torch.tensor(terminal_sigmas).float().std().item(),
                 'l_seq_mean': sum(seq_losses) / len(seq_losses),
                 'l_seq_std': torch.tensor(seq_losses).std().item(),
                 'l_delta_mean': sum(delta_losses) / len(delta_losses),
@@ -294,7 +320,9 @@ class HazardEvaluator:
         logger.info(f"  Reward:       {hazard['reward_mean']:.4f} ± {hazard['reward_std']:.4f}")
         logger.info(f"  Quality:      {hazard['quality_mean']:.4f} ± {hazard['quality_std']:.4f}")
         logger.info(f"  Cost:         {hazard['cost_mean']:.4f} ± {hazard['cost_std']:.4f}")
-        logger.info(f"  Video Steps:  {hazard['video_steps_mean']:.2f} ± {hazard['video_steps_std']:.2f}")
+        logger.info(f"  Executed:     {hazard['executed_video_steps_mean']:.2f} ± {hazard['executed_video_steps_std']:.2f}")
+        logger.info(f"  Equivalent K: {hazard['equivalent_fixed_steps_mean']:.2f} ± {hazard['equivalent_fixed_steps_std']:.2f}")
+        logger.info(f"  Terminal σ:   {hazard['terminal_sigma_mean']:.4f} ± {hazard['terminal_sigma_std']:.4f}")
         logger.info(f"  L_seq:        {hazard['l_seq_mean']:.4f} ± {hazard['l_seq_std']:.4f}")
         logger.info(f"  L_delta:      {hazard['l_delta_mean']:.4f} ± {hazard['l_delta_std']:.4f}")
 
@@ -308,6 +336,9 @@ class HazardEvaluator:
                 logger.info(f"    Reward:       {baseline['reward_mean']:.4f} ± {baseline['reward_std']:.4f}")
                 logger.info(f"    Quality:      {baseline['quality_mean']:.4f} ± {baseline['quality_std']:.4f}")
                 logger.info(f"    Cost:         {baseline['cost_mean']:.4f} ± {baseline['cost_std']:.4f}")
+                logger.info(f"    Executed:     {baseline['executed_video_steps_mean']:.2f} ± {baseline['executed_video_steps_std']:.2f}")
+                logger.info(f"    Equivalent K: {baseline['equivalent_fixed_steps_mean']:.2f} ± {baseline['equivalent_fixed_steps_std']:.2f}")
+                logger.info(f"    Terminal σ:   {baseline['terminal_sigma_mean']:.4f} ± {baseline['terminal_sigma_std']:.4f}")
                 logger.info(f"    L_seq:        {baseline['l_seq_mean']:.4f} ± {baseline['l_seq_std']:.4f}")
                 logger.info(f"    L_delta:      {baseline['l_delta_mean']:.4f} ± {baseline['l_delta_std']:.4f}")
 
@@ -493,27 +524,13 @@ def main():
     ).to(device=device, dtype=dtype)
     transformer.eval()
 
-    # Create Hazard scheduler head
-    logger.info("Creating HazardSchedulerHead")
-    video_feature_dim = get_model_hidden_dim(transformer)
-    scheduler_hidden_dim = get_scheduler_hidden_dim(config, video_feature_dim)
-    logger.info(
-        "HazardSchedulerHead dims: feature_dim=%d hidden_dim=%d",
-        video_feature_dim,
-        scheduler_hidden_dim,
-    )
-    scheduler_head = HazardSchedulerHead(
-        feature_dim=video_feature_dim,
-        hidden_dim=scheduler_hidden_dim,
-        output_dim=1,
-        use_context=False,
-    ).to(device, dtype=dtype)
-
-    # Load checkpoint
     logger.info(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    scheduler_head.load_state_dict(
-        normalize_scheduler_state_dict(checkpoint['scheduler_head_state_dict'])
+    scheduler_head, checkpoint = load_hazard_scheduler_head(
+        transformer=transformer,
+        config=config,
+        checkpoint_path=args.checkpoint,
+        device=device,
+        dtype=dtype,
     )
     logger.info(f"Loaded checkpoint from step {checkpoint['step']}")
 

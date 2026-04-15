@@ -1,25 +1,23 @@
 launcher:
   config_name: robotwin_hazard_train
-  ngpu: 8
-  master_port: 29528
+  ngpu: 1
+  master_port: 29533
   log_rank: 0
   torchft_lighthouse: http://localhost:29510
   force_attn_mode: torch
 
 paths:
-  train_model_path: /data/syr/models/lingbot-va-posttrain-robotwin
-  dataset_path: /data/syr/datasets/robotwin-clean-and-aug-lerobot
-  save_root: /data/syr/train_out/robotwin_hazard_local_8gpu
-  reference_model_path: /data/syr/models/lingbot-va-posttrain-robotwin
+  train_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+  dataset_path: /mnt/sda/syr/lerobot_datasets/robotwin-clean-and-aug-lerobot
+  save_root: /tmp/robotwin_hazard_debug_local
+  reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
 
 logging:
-  enable_wandb: true
+  enable_wandb: false
   wandb_project: va_robotwin_hazard
-  wandb_mode: online
   wandb_team_name: ""
   wandb_base_url: ""
   wandb_api_key: ""
-  run_name_prefix: robotwin_hazard_local_8gpu
 
 model:
   enable_action_residual_adapter: false
@@ -27,7 +25,7 @@ model:
   action_adapter_dropout: 0.0
   enable_hazard_scheduler: true
   hazard_hidden_dim: 512
-  hazard_K_max: 25
+  hazard_K_max: 10
 
 trainable:
   freeze_backbone: true
@@ -39,24 +37,24 @@ trainable:
   train_hazard_scheduler: true
 
 training:
-  load_workers: 4
-  init_workers: 4
-  save_interval: 1000
-  gc_interval: 50
+  load_workers: 0
+  init_workers: 1
+  save_interval: 5
+  gc_interval: 5
   cfg_prob: 0.0
   batch_size: 1
   gradient_accumulation_steps: 1
-  num_steps: 10000
+  num_steps: 20
 
 hazard:
+  baseline_Ks: [5, 10, 15, 20, 25]
   policy_variant: stop_jump_v2
   optimizer_mode: ppo
   learning_rate: 1e-4
   lambda_cost: 0.1
   lambda_kl: 0.01
-  baseline_K: 25
-  kl_reference_K: 25
-  baseline_Ks: [5, 10, 15, 20, 25]
+  baseline_K: 10
+  kl_reference_K: 10
   K_min: 3
   eta: 0.8
   sigma_min: 0.01
@@ -65,7 +63,7 @@ hazard:
   jump_ref_concentration: 20.0
   heuristic_jump_mode: 0.75
   heuristic_jump_concentration: 10.0
-  ppo_num_epochs: 4
+  ppo_num_epochs: 2
   cliprange: 0.2
   jump_logprob_scale: 0.3
   advantage_normalize: true
@@ -74,7 +72,7 @@ hazard:
   reward_adv_baseline: ema
   reward_ema_decay: 0.95
   reward_anchor_lo_k: 4
-  reward_anchor_hi_k: 25
+  reward_anchor_hi_k: 10
   reward_skip_initial_action_frames: 1
   reward_w_seq: 0.7
   reward_w_delta: 0.3
@@ -95,9 +93,8 @@ hazard:
   reward_cost_c0: 0.2
   reward_cost_c1: 0.0
   reward_cost_gamma: 2.0
-  log_interval: 10
-  save_interval: 1000
+  log_interval: 1
+  save_interval: 5
   val_split: 0.1
 
-monitoring:
-  heartbeat_interval_seconds: 30
+max_dataset_repos: 1

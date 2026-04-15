@@ -3,7 +3,6 @@ import torch
 import torch.distributed as dist
 
 from .logging import logger
-from .Simple_Remote_Infer.deploy.websocket_policy_server import WebsocketPolicyServer
 
 
 class DistributedModelWrapper:
@@ -71,6 +70,8 @@ def worker_loop(model, local_rank):
 def run_async_server_mode(model, local_rank, host, port):
     logger.info("Running in ASYNC SERVER mode")
     if local_rank == 0:
+        from .Simple_Remote_Infer.deploy.websocket_policy_server import WebsocketPolicyServer
+
         dist_model = DistributedModelWrapper(model, local_rank=local_rank)
         metadata = {}
         if hasattr(model, "get_server_metadata"):

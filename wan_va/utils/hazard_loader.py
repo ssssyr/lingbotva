@@ -7,9 +7,9 @@ from __future__ import annotations
 import torch
 
 try:
-    from ..modules.hazard_scheduler import HazardSchedulerHead
+    from ..modules.hazard_scheduler import HazardJumpSchedulerHead, HazardSchedulerHead
 except ImportError:  # pragma: no cover - script-style imports in wan_va_server.py
-    from modules.hazard_scheduler import HazardSchedulerHead
+    from modules.hazard_scheduler import HazardJumpSchedulerHead, HazardSchedulerHead
 
 
 def get_model_hidden_dim(transformer) -> int:
@@ -48,14 +48,30 @@ def load_hazard_scheduler_head(transformer, config, checkpoint_path, device, dty
     checkpoint_path = str(checkpoint_path)
     video_feature_dim = get_model_hidden_dim(transformer)
     scheduler_hidden_dim = get_scheduler_hidden_dim(config, video_feature_dim)
-    scheduler_head = HazardSchedulerHead(
-        feature_dim=video_feature_dim,
-        hidden_dim=scheduler_hidden_dim,
-        output_dim=1,
-        use_context=False,
-    ).to(device=device, dtype=dtype)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    policy_variant = str(
+        checkpoint.get(
+            "policy_variant",
+            getattr(getattr(config, "hazard", None), "policy_variant", "stop_only_v1"),
+        )
+    ).lower()
+    if policy_variant == "stop_jump_v2":
+        hazard_cfg = getattr(config, "hazard", None)
+        scheduler_head = HazardJumpSchedulerHead(
+            feature_dim=video_feature_dim,
+            hidden_dim=scheduler_hidden_dim,
+            use_context=False,
+            init_jump_mode=float(getattr(hazard_cfg, "heuristic_jump_mode", 0.75) if hazard_cfg is not None else 0.75),
+            init_jump_concentration=float(getattr(hazard_cfg, "heuristic_jump_concentration", 10.0) if hazard_cfg is not None else 10.0),
+        ).to(device=device, dtype=dtype)
+    else:
+        scheduler_head = HazardSchedulerHead(
+            feature_dim=video_feature_dim,
+            hidden_dim=scheduler_hidden_dim,
+            output_dim=1,
+            use_context=False,
+        ).to(device=device, dtype=dtype)
     scheduler_head.load_state_dict(
         normalize_scheduler_state_dict(checkpoint["scheduler_head_state_dict"])
     )

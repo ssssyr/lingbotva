@@ -1,25 +1,25 @@
 launcher:
   config_name: robotwin_hazard_train
-  ngpu: 8
-  master_port: 29528
+  ngpu: 2
+  master_port: 29535
   log_rank: 0
   torchft_lighthouse: http://localhost:29510
   force_attn_mode: torch
 
 paths:
-  train_model_path: /data/syr/models/lingbot-va-posttrain-robotwin
-  dataset_path: /data/syr/datasets/robotwin-clean-and-aug-lerobot
-  save_root: /data/syr/train_out/robotwin_hazard_local_8gpu
-  reference_model_path: /data/syr/models/lingbot-va-posttrain-robotwin
+  train_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
+  dataset_path: /mnt/sda/syr/lerobot_datasets/robotwin-clean-and-aug-lerobot
+  save_root: /mnt/sda/syr/train_out/robotwin_hazard_local_2gpu
+  reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
 
 logging:
-  enable_wandb: true
+  enable_wandb: false
   wandb_project: va_robotwin_hazard
-  wandb_mode: online
+  wandb_mode: offline
   wandb_team_name: ""
   wandb_base_url: ""
   wandb_api_key: ""
-  run_name_prefix: robotwin_hazard_local_8gpu
+  run_name_prefix: robotwin_hazard_local_2gpu
 
 model:
   enable_action_residual_adapter: false
@@ -49,6 +49,7 @@ training:
   num_steps: 10000
 
 hazard:
+  baseline_Ks: [5, 10, 15, 20, 25]
   policy_variant: stop_jump_v2
   optimizer_mode: ppo
   learning_rate: 1e-4
@@ -56,7 +57,6 @@ hazard:
   lambda_kl: 0.01
   baseline_K: 25
   kl_reference_K: 25
-  baseline_Ks: [5, 10, 15, 20, 25]
   K_min: 3
   eta: 0.8
   sigma_min: 0.01

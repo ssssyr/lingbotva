@@ -25,7 +25,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from wan_va.modules.model import WanTransformer3DModel
-from wan_va.modules.hazard_scheduler import HazardSchedulerHead
+from wan_va.modules.hazard_scheduler import HazardJumpSchedulerHead, HazardSchedulerHead
 from wan_va.modules.utils import load_transformer
 from wan_va.configs import VA_CONFIGS
 from wan_va.utils.hazard_trainer import HazardTrainer
@@ -59,6 +59,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Hazard scheduler")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
+    parser.add_argument("--resume-checkpoint", type=str, default=None, help="Optional checkpoint path to resume from")
     return parser.parse_args()
 
 
@@ -209,6 +210,13 @@ def get_scheduler_hidden_dim(config, default_dim: int) -> int:
     return configured_dim
 
 
+def get_policy_variant(config) -> str:
+    hazard_cfg = getattr(config, "hazard", None)
+    if hazard_cfg is None:
+        return str(getattr(config, "hazard_policy_variant", "stop_only_v1")).lower()
+    return str(getattr(hazard_cfg, "policy_variant", "stop_only_v1")).lower()
+
+
 def resolve_run_name(config, rank: int) -> str:
     logging_cfg = getattr(config, "logging", None)
     env_name = os.environ.get("LINGBOT_HAZARD_RUN_NAME")
@@ -249,6 +257,16 @@ def prepare_run_directory(config, rank: int, world_size: int) -> Path:
     return run_dir
 
 
+def reuse_run_directory(config, run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    base_save_root = run_dir.parent.parent
+    config.run_name = run_dir.name
+    config.run_dir = str(run_dir)
+    config.paths.base_save_root = str(base_save_root)
+    config.paths.save_root = str(run_dir)
+    return run_dir
+
+
 def split_dataset_for_train(dataset, val_ratio: float = 0.1):
     """Simple holdout split so training does not consume the full dataset."""
     total = len(dataset)
@@ -274,7 +292,11 @@ def main():
     config.world_size = world_size
     config.local_rank = local_rank
 
-    run_dir = prepare_run_directory(config, rank=rank, world_size=world_size)
+    if args.resume_checkpoint:
+        resume_checkpoint = Path(args.resume_checkpoint).expanduser().resolve()
+        run_dir = reuse_run_directory(config, resume_checkpoint.parent.parent)
+    else:
+        run_dir = prepare_run_directory(config, rank=rank, world_size=world_size)
     init_logger(
         log_file=run_dir / "logs" / f"train_rank{rank}.log",
         rank=rank,
@@ -308,7 +330,7 @@ def main():
 
     if int(config.training.batch_size) != 1:
         raise ValueError(
-            "Hazard V1 currently only supports training.batch_size=1 "
+            "Current hazard trainer only supports training.batch_size=1 "
             f"(got {config.training.batch_size})."
         )
 
@@ -338,20 +360,32 @@ def main():
     )
 
     # Create Hazard scheduler head
-    logger.info("Creating HazardSchedulerHead")
+    logger.info("Creating hazard scheduler head")
     video_feature_dim = get_model_hidden_dim(transformer)
     scheduler_hidden_dim = get_scheduler_hidden_dim(config, video_feature_dim)
+    policy_variant = get_policy_variant(config)
     logger.info(
-        "HazardSchedulerHead dims: feature_dim=%d hidden_dim=%d",
+        "Hazard scheduler dims: feature_dim=%d hidden_dim=%d policy_variant=%s",
         video_feature_dim,
         scheduler_hidden_dim,
+        policy_variant,
     )
-    scheduler_head = HazardSchedulerHead(
-        feature_dim=video_feature_dim,
-        hidden_dim=scheduler_hidden_dim,
-        output_dim=1,
-        use_context=False,
-    ).to(device=device, dtype=torch.float32)
+    if policy_variant == "stop_jump_v2":
+        hazard_cfg = getattr(config, "hazard", None)
+        scheduler_head = HazardJumpSchedulerHead(
+            feature_dim=video_feature_dim,
+            hidden_dim=scheduler_hidden_dim,
+            use_context=False,
+            init_jump_mode=float(getattr(hazard_cfg, "heuristic_jump_mode", 0.75) if hazard_cfg is not None else 0.75),
+            init_jump_concentration=float(getattr(hazard_cfg, "heuristic_jump_concentration", 10.0) if hazard_cfg is not None else 10.0),
+        ).to(device=device, dtype=torch.float32)
+    else:
+        scheduler_head = HazardSchedulerHead(
+            feature_dim=video_feature_dim,
+            hidden_dim=scheduler_hidden_dim,
+            output_dim=1,
+            use_context=False,
+        ).to(device=device, dtype=torch.float32)
 
     # Keep the scheduler head as a plain module. We synchronize its gradients
     # manually in HazardTrainer to avoid DDP constructor collectives stalling
@@ -449,6 +483,17 @@ def main():
         wandb=wandb,
         monitor=monitor,
     )
+    if args.resume_checkpoint:
+        trainer.load_checkpoint(args.resume_checkpoint)
+        trainer.micro_step = trainer.step
+        logger.info("Resumed hazard training from checkpoint %s", args.resume_checkpoint)
+        monitor.maybe_heartbeat(
+            step=trainer.step,
+            micro_step=trainer.micro_step,
+            max_steps=trainer.max_steps,
+            note="resumed_from_checkpoint",
+            force=True,
+        )
 
     try:
         trainer.train()
