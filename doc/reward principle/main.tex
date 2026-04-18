@@ -1,0 +1,924 @@
+\documentclass[12pt]{ctexart}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,array}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\title{Hazard Scheduler 奖励函数原理讲解\\小白友好版}
+\author{基于当前项目代码整理}
+\date{2026年4月}
+
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2.2em}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{这份文档是讲什么的}
+
+这份文档不是在讲一个抽象的“理想奖励函数”，而是在讲当前项目里\textbf{真正落地到代码中的奖励函数}。它主要对应以下位置：
+
+\begin{itemize}
+    \item 奖励函数主体：\texttt{wan\_va/utils/hazard\_reward.py}
+    \item 训练时如何使用奖励：\texttt{wan\_va/utils/hazard\_trainer.py}
+    \item 典型配置：\texttt{train\_profiles/robotwin\_hazard\_local\_8gpu.yaml}
+    \item 参考设计稿：\texttt{doc/Hazard\_Scheduler\_新奖励函数设计方案.docx}
+\end{itemize}
+
+需要先说明一个很重要的事实：
+
+\begin{itemize}
+    \item 参考设计稿里提出过一个更完整的思路，例如“首帧项 + 序列项 + 趋势项”。
+    \item 但\textbf{当前代码实际实现}并不是完全照着设计稿逐字落地。
+    \item 当前代码实际采用的是：\textbf{序列质量项 + 趋势质量项 + 非线性计算成本}。
+    \item 对“首帧”的处理方式不是单独加一个奖励项，而是\textbf{直接跳过最前面的若干动作帧}，默认跳过 1 帧，避免被 conditioning 的首帧干扰。
+\end{itemize}
+
+所以，如果你看过设计稿，又来看代码，可能会觉得“怎么有点不一样”。这不是你看错了，而是因为\textbf{设计稿是方案，代码是当前版本的实际实现}。这份文档会把两者的关系讲清楚，但解释重点以代码为准。
+
+\section{先用一句人话讲明白}
+
+当前奖励函数要回答的问题，其实很朴素：
+
+\begin{quote}
+    对于某一个样本，Hazard Scheduler 选择现在停下，到底值不值？
+\end{quote}
+
+“值不值”不是只看一种东西，而是同时看两件事：
+
+\begin{enumerate}
+    \item \textbf{质量有没有足够好}：当前生成出的动作，和专家动作像不像。
+    \item \textbf{代价是不是太大}：为了得到这个动作，你已经花了多少视频去噪步数。
+\end{enumerate}
+
+因此，当前项目里的核心思想可以概括成一句话：
+
+\begin{quote}
+    \textbf{奖励 = 质量收益 - 计算成本}
+\end{quote}
+
+写成公式，就是：
+
+\begin{equation}
+    R = Q - C
+\end{equation}
+
+其中：
+
+\begin{itemize}
+    \item $R$ 表示最终奖励，越大越好。
+    \item $Q$ 表示质量收益，意思是“这条路径到底帮我们恢复了多少有用的动作质量”。
+    \item $C$ 表示计算成本，意思是“为了得到这条路径，我们付出了多少计算预算”。
+\end{itemize}
+
+如果只看质量，不看成本，模型可能会想：那我永远多算几步，通常会更稳。
+
+如果只看成本，不看质量，模型可能会想：那我干脆尽快停，反正越少算越便宜。
+
+奖励函数的作用，就是在这两者之间找平衡。
+
+\section{为什么旧奖励函数不够好}
+
+参考设计稿里总结过旧思路的核心形式，大致可以理解为：
+
+\begin{equation}
+    R_{\text{old}} = -\text{action\_loss} - \lambda \cdot \text{video\_steps}
+\end{equation}
+
+它的问题，不在于“完全错了”，而在于\textbf{太粗}。粗在哪里？
+
+\subsection{问题一：动作质量看得太粗}
+
+旧思路里常常把动作质量压成一个总的误差，例如平均动作误差。这样会导致几个问题：
+
+\begin{itemize}
+    \item 它不太关心\textbf{动作序列里哪些时刻更重要}。
+    \item 它不太区分\textbf{位置错一点}、\textbf{姿态错一点}、\textbf{夹爪开合错了}，这三种错误的语义差别。
+    \item 它也不太关心\textbf{动作趋势是否正确}，也就是“虽然每帧不完全一样，但整体运动方向是不是对的”。
+\end{itemize}
+
+\subsection{问题二：不同样本难度不一样，但旧奖励没显式考虑}
+
+有的样本本来就简单，4 步和 25 步差别不大；有的样本很难，多算几步确实有明显提升。
+
+如果奖励函数只用一个全局统一的绝对误差去比较，调度器就很难学到：
+
+\begin{quote}
+    这个样本值得多算，那一个样本不值得多算。
+\end{quote}
+
+最后很容易塌成一种比较死板的策略，例如总是偏向某个固定低步数。
+
+\subsection{问题三：线性成本太容易把策略压扁}
+
+如果每多算一步，都按同样的价格收费，那么模型会倾向于想：
+
+\begin{quote}
+    既然后面每一步都一样贵，那我不如统一少算点。
+\end{quote}
+
+但实际直觉往往不是这样。很多系统里，前面几步是“基础投入”，后面越来越多的步数才是“额外精修”。因此后面的步数更贵，反而更符合“预算应该慎用”的思想。
+
+\section{当前奖励函数的总结构}
+
+当前代码中的总结构是：
+
+\begin{equation}
+    R = Q_{\text{seq}} + Q_{\Delta} - \lambda_c \cdot C(K)
+\end{equation}
+
+这里的每一部分都很重要：
+
+\begin{itemize}
+    \item $Q_{\text{seq}}$：看\textbf{整段动作序列}像不像专家。
+    \item $Q_{\Delta}$：看\textbf{动作变化趋势}像不像专家。
+    \item $K$：当前这条路径实际用了多少视频步数。
+    \item $C(K)$：把步数 $K$ 转成一个\textbf{非线性的归一化成本}。
+    \item $\lambda_c$：控制“省算力”和“保质量”之间谁更重要。
+\end{itemize}
+
+当前配置文件里，常见默认值是：
+
+\begin{itemize}
+    \item \texttt{reward\_w\_seq = 0.7}
+    \item \texttt{reward\_w\_delta = 0.3}
+    \item \texttt{reward\_lambda\_c = 0.4}
+\end{itemize}
+
+这表示系统目前更看重\textbf{整段动作本身对不对}，其次再看\textbf{动作变化趋势对不对}。
+
+\section{先理解训练时到底在比较谁}
+
+这里是很多人第一次看代码最容易懵的地方。
+
+当前奖励不是拿“当前路径”和真值直接做一次比较就结束，而是会同时准备\textbf{三条路径}：
+
+\begin{enumerate}
+    \item \textbf{current}：当前 scheduler 真正采样出来的路径，也就是我们要给奖励的这条路径。
+    \item \textbf{anchor\_lo}：低预算锚点路径，通常是比较便宜、比较粗糙的固定步数结果。
+    \item \textbf{anchor\_hi}：高质量锚点路径，通常是高步数、质量更好的固定步数结果。
+\end{enumerate}
+
+项目里常见配置是：
+
+\begin{itemize}
+    \item \texttt{reward\_anchor\_lo\_k = 4}
+    \item \texttt{reward\_anchor\_hi\_k = 25}
+\end{itemize}
+
+这两个锚点的作用，可以类比成：
+
+\begin{itemize}
+    \item \textbf{低锚点}告诉你：如果我很省预算，大概能做到什么程度。
+    \item \textbf{高锚点}告诉你：如果我预算比较充足，大概能做到什么程度。
+\end{itemize}
+
+于是，当前路径的价值就不再是“绝对有多好”，而变成：
+
+\begin{quote}
+    相对于便宜方案，我提升了多少；相对于高质量方案，我还差多少。
+\end{quote}
+
+这就是所谓的\textbf{双锚点}思想。
+
+\section{第一步：先把动作张量变成“人能理解的动作”}
+
+模型输出的动作一开始不是“左手位置、右手姿态、夹爪开合”这种直接可读的形式，而是一大块归一化后的张量。
+
+当前代码会先做两件事：
+
+\subsection{1. 动作反归一化}
+
+代码通过 \texttt{q01} 和 \texttt{q99} 把动作从 $[-1,1]$ 区间映射回原始物理量尺度。直观理解就是：
+
+\begin{quote}
+    先把模型内部用的标准化数值，还原回真实动作空间。
+\end{quote}
+
+\subsection{2. 把动作拆成语义部件}
+
+当前 RobotWin 奖励解析器会把动作拆成这些部分：
+
+\begin{itemize}
+    \item 左臂末端位置 \texttt{pos\_left}
+    \item 左臂末端四元数姿态 \texttt{quat\_left}
+    \item 右臂末端位置 \texttt{pos\_right}
+    \item 右臂末端四元数姿态 \texttt{quat\_right}
+    \item 左夹爪开合 \texttt{grip\_left}
+    \item 右夹爪开合 \texttt{grip\_right}
+\end{itemize}
+
+这样后面就可以分别衡量：
+
+\begin{itemize}
+    \item 位置准不准
+    \item 姿态准不准
+    \item 夹爪开关准不准
+\end{itemize}
+
+\subsection{3. 默认跳过第一帧动作}
+
+代码中有一个配置：
+
+\begin{equation}
+    \texttt{reward\_skip\_initial\_action\_frames} = 1
+\end{equation}
+
+它的意思是：\textbf{前面 1 帧动作默认不参与奖励计算}。
+
+为什么？
+
+因为很多时候第一帧动作更像是 conditioning 给定的上下文，或者容易受到输入对齐方式的影响。如果把它也硬算进奖励，可能会引入不公平噪声。
+
+所以当前实现没有单独做“首帧奖励项”，而是采用了更稳妥的策略：
+
+\begin{quote}
+    直接把最开始那几帧从奖励统计中跳过。
+\end{quote}
+
+\section{第二步：序列误差是怎么计算的}
+
+序列误差关心的是：
+
+\begin{quote}
+    整段动作每个时刻本身，和专家动作有多像。
+\end{quote}
+
+代码里的序列误差可以概括成：
+
+\begin{equation}
+    L_{\text{seq}} =
+    \sum_t \omega_t
+    \left(
+    \alpha_p E^{(t)}_{\text{pos}}
+    + \alpha_r E^{(t)}_{\text{rot}}
+    + \alpha_g E^{(t)}_{\text{grip}}
+    \right)
+\end{equation}
+
+你可以把它拆成三块理解。
+
+\subsection{1. 位置误差}
+
+位置误差用的是 \texttt{smooth\_l1\_loss}。直观上可以理解为：
+
+\begin{quote}
+    预测位置和真值位置差多少，就要付出对应代价。
+\end{quote}
+
+这里左右手的位置误差都会被加起来。
+
+\subsection{2. 姿态误差}
+
+姿态不是直接用普通减法，而是先把四元数规范化，再计算\textbf{角度差}。
+
+原因很简单：姿态本来就是旋转，直接拿四元数逐维相减不够符合几何意义。用角度差更接近“两个姿态到底差了多少旋转”。
+
+\subsection{3. 夹爪误差}
+
+夹爪开合的误差使用的是\textbf{二元交叉熵}。通俗讲，就是把夹爪当成一种接近开/关的状态，预测错了就惩罚。
+
+\subsection{4. 三种误差怎么加权}
+
+当前配置中常见权重是：
+
+\begin{itemize}
+    \item \texttt{reward\_pos\_weight = 1.0}
+    \item \texttt{reward\_rot\_weight = 0.6}
+    \item \texttt{reward\_gripper\_weight = 0.8}
+\end{itemize}
+
+这说明当前实现里：
+
+\begin{itemize}
+    \item 位置误差最重要
+    \item 夹爪误差也很重要
+    \item 姿态误差稍低一些，但仍然参与
+\end{itemize}
+
+你可以把它理解成：
+
+\begin{quote}
+    系统认为“手要到对的位置”最关键，“夹爪开合要对”也很关键，“姿态要完全精确”也重要，但略次于前两者。
+\end{quote}
+
+\section{第三步：为什么还要计算趋势误差}
+
+只看每一帧像不像，还不够。
+
+举个直观例子：
+
+\begin{itemize}
+    \item 某条预测轨迹每一帧单看都还行。
+    \item 但它可能整体动作节奏不对，运动方向不对，开夹爪和闭夹爪的时机也不对。
+\end{itemize}
+
+所以当前代码又额外引入了\textbf{趋势误差}，也就是比较相邻时刻之间的变化是否正确。
+
+公式上可以理解为：
+
+\begin{equation}
+    L_{\Delta} =
+    \sum_t \tilde{\omega}_t
+    \left(
+    \beta_p E^{(t)}_{\Delta\text{pos}}
+    + \beta_r E^{(t)}_{\Delta\text{rot}}
+    + \beta_g E^{(t)}_{\Delta\text{grip}}
+    \right)
+\end{equation}
+
+它比较的是“差分”：
+
+\begin{itemize}
+    \item 位置差分：这一帧相对上一帧移动了多少
+    \item 姿态差分：这一帧相对上一帧转了多少
+    \item 夹爪差分：这一帧相对上一帧开合变化了多少
+\end{itemize}
+
+\subsection{为什么趋势项有价值}
+
+趋势项在直觉上是在问：
+
+\begin{quote}
+    你不只是最后长得像，而且运动过程也要像。
+\end{quote}
+
+这样做的好处是：
+
+\begin{itemize}
+    \item 能更好地区分“静态像”和“动态像”。
+    \item 对抓取、移动、释放这类有明显阶段结构的动作很有帮助。
+    \item 对“夹爪什么时候变化”这类关键信号更敏感。
+\end{itemize}
+
+\subsection{趋势项的常见权重}
+
+当前配置里常见参数是：
+
+\begin{itemize}
+    \item \texttt{reward\_delta\_pos\_weight = 1.0}
+    \item \texttt{reward\_delta\_rot\_weight = 0.2}
+    \item \texttt{reward\_delta\_gripper\_weight = 0.6}
+\end{itemize}
+
+这说明趋势项内部也是：
+
+\begin{itemize}
+    \item 位置变化最关键
+    \item 夹爪变化也很关键
+    \item 姿态变化参与，但权重较小
+\end{itemize}
+
+\section{第四步：为什么每个时刻的权重不一样}
+
+这也是当前实现里非常关键、也非常容易被忽略的一点。
+
+奖励函数并不是把所有时刻平均看待，而是会给不同时间位置分配不同权重。这套权重由 \texttt{NonUniformTimeWeightBuilder} 生成。
+
+简单讲，它在做的事是：
+
+\begin{quote}
+    重要的时刻多看一点，不重要的时刻少看一点。
+\end{quote}
+
+\subsection{时间权重的基本直觉}
+
+当前时间权重大概会考虑三类因素：
+
+\begin{enumerate}
+    \item \textbf{越靠前的时刻，基础权重越大}。
+    \item \textbf{运动变化越大的时刻，权重越大}。
+    \item \textbf{夹爪发生明显开关变化的时刻，权重越大}。
+\end{enumerate}
+
+对应代码中的核心形式可以理解为：
+
+\begin{equation}
+    \omega_t \propto
+    e^{-\rho t}
+    \left(
+    1 + \eta_{\text{motion}} m_t + \eta_{\text{gripper}} g_t + \eta_{\text{early}} e^{-t}
+    \right)
+\end{equation}
+
+这里：
+
+\begin{itemize}
+    \item $\rho$ 控制随时间衰减的速度
+    \item $m_t$ 表示这一时刻动作变化大不大
+    \item $g_t$ 表示这一时刻有没有明显夹爪事件
+    \item $\eta$ 系列参数控制这些因素各自有多重要
+\end{itemize}
+
+\subsection{为什么要这样做}
+
+因为在机器人动作里，不同片段的重要性真的差很多。
+
+例如：
+
+\begin{itemize}
+    \item 平稳等待的几帧，错一点可能影响不大。
+    \item 接近目标物体的几帧，位置一错就可能抓空。
+    \item 夹爪闭合的那一刻，如果错了，任务可能直接失败。
+\end{itemize}
+
+所以“平均对待所有帧”其实并不合理。当前实现通过非均匀时间权重，把注意力更多放到真正关键的片段上。
+
+\subsection{当前常见时间权重参数}
+
+\begin{itemize}
+    \item \texttt{reward\_time\_rho = 0.08}
+    \item \texttt{reward\_time\_eta\_motion = 0.6}
+    \item \texttt{reward\_time\_eta\_gripper = 1.2}
+    \item \texttt{reward\_time\_eta\_early = 0.0}
+\end{itemize}
+
+从这组参数可以看出：
+
+\begin{itemize}
+    \item 项目目前明显比较重视\textbf{夹爪事件}。
+    \item 也重视\textbf{运动幅度大的时刻}。
+    \item 但并没有额外再强化“特别早期”的时刻，因为 \texttt{eta\_early} 目前是 0。
+\end{itemize}
+
+\section{第五步：双锚点到底怎么把 loss 变成 quality}
+
+到这里为止，我们已经能算出三条路径各自的误差：
+
+\begin{itemize}
+    \item 当前路径的序列误差和趋势误差
+    \item 低锚点路径的序列误差和趋势误差
+    \item 高锚点路径的序列误差和趋势误差
+\end{itemize}
+
+但问题来了：
+
+\begin{quote}
+    误差本身是“越小越好”，怎么才能把它变成“越大越好”的奖励呢？
+\end{quote}
+
+当前代码的答案是：\textbf{看当前路径在低锚点和高锚点之间，恢复了多少。}
+
+\subsection{1. 可恢复空间 improvement / gap}
+
+代码中先计算：
+
+\begin{equation}
+    \text{improvement} = \max(L_{\text{lo}} - L_{\text{hi}}, 0)
+\end{equation}
+
+\begin{equation}
+    \text{gap} = \max(L_{\text{lo}} - L_{\text{hi}}, \varepsilon)
+\end{equation}
+
+直觉上：
+
+\begin{itemize}
+    \item 如果低锚点和高锚点差很多，说明这个样本确实有明显的“可恢复空间”。
+    \item 如果低锚点和高锚点差很小，说明这个样本本来就没太多提升空间。
+\end{itemize}
+
+\subsection{2. 当前路径恢复了多少 gain}
+
+接着代码会算：
+
+\begin{equation}
+    g = \text{clip}\left(\frac{L_{\text{lo}} - L_{\text{cur}}}{\text{gap}}, -1, 1\right)
+\end{equation}
+
+这个量非常关键，可以把它理解为：
+
+\begin{itemize}
+    \item $g = 1$：当前路径已经接近高锚点水平了。
+    \item $g = 0$：当前路径和低锚点差不多，没有恢复出什么额外质量。
+    \item $g < 0$：当前路径甚至比低锚点还差。
+\end{itemize}
+
+所以，$g$ 本质上是在问：
+
+\begin{quote}
+    在“从便宜方案到高质量方案”的这段提升空间里，你走了多远？
+\end{quote}
+
+\subsection{3. 难度因子 difficulty}
+
+当前代码还会算一个难度系数：
+
+\begin{equation}
+    d = \frac{\text{improvement}}{\text{improvement} + \kappa}
+\end{equation}
+
+其中 $\kappa$ 来自参数 \texttt{reward\_difficulty\_kappa}，当前常见值为 0.1。
+
+这个式子非常有意思。它的意思是：
+
+\begin{itemize}
+    \item 如果一个样本低锚点和高锚点差很多，那么 improvement 大，$d$ 就接近 1。
+    \item 如果一个样本低锚点和高锚点差很小，那么 improvement 小，$d$ 就比较小。
+\end{itemize}
+
+换句话说：
+
+\begin{quote}
+    真正存在“提升空间”的样本，它的质量收益更值得被看重。
+\end{quote}
+
+\subsection{4. 最终质量项}
+
+对每个质量分支（序列项、趋势项），当前代码的质量计算大致是：
+
+\begin{equation}
+    Q_j = w_j \left(d_j \cdot \max(g_j, 0) - \lambda_{\text{neg}} \cdot \max(-g_j, 0)\right)
+\end{equation}
+
+其中：
+
+\begin{itemize}
+    \item $j$ 可以是 \texttt{seq} 或 \texttt{delta}
+    \item $w_j$ 是该分支权重
+    \item $d_j$ 是该分支的难度权重
+    \item $g_j$ 是该分支的归一化增益
+    \item $\lambda_{\text{neg}}$ 控制“比低锚点还差”时要罚多重
+\end{itemize}
+
+然后总质量就是：
+
+\begin{equation}
+    Q = Q_{\text{seq}} + Q_{\Delta}
+\end{equation}
+
+\subsection{这一步的人话解释}
+
+可以直接理解成：
+
+\begin{quote}
+    如果当前路径比低锚点更好，那就奖励你，而且这个奖励会参考这个样本到底有没有真实提升空间。
+\end{quote}
+
+\begin{quote}
+    如果当前路径甚至比低锚点还差，那就罚你，而且会用 $\lambda_{\text{neg}}$ 控制惩罚力度。
+\end{quote}
+
+这套设计的好处，是奖励不再是死板的“绝对误差越小越好”，而是变成：
+
+\begin{quote}
+    你相对一个便宜基线，究竟赚回来了多少有意义的质量。
+\end{quote}
+
+\section{第六步：成本为什么不是线性的}
+
+当前代码里的成本不是简单的：
+
+\begin{equation}
+    C(K) = K
+\end{equation}
+
+而是先给每一步定义一个递增代价，再做前缀和，最后归一化。单步成本大致是：
+
+\begin{equation}
+    c(k) = c_0 + c_1 \left(\frac{k}{K_{\max}}\right)^{\gamma}
+\end{equation}
+
+然后总成本是：
+
+\begin{equation}
+    C(K) = \frac{\sum_{k=1}^{K} c(k)}{\sum_{k=1}^{K_{\max}} c(k)}
+\end{equation}
+
+这意味着：
+
+\begin{itemize}
+    \item 前几步不会太贵
+    \item 越往后，每一步越贵
+    \item 最终成本会被归一化到大致 $[0,1]$ 的范围
+\end{itemize}
+
+\subsection{为什么这样更合理}
+
+这很像现实中的预算分配：
+
+\begin{itemize}
+    \item 前几步属于“打底”
+    \item 再往后属于“精修”
+    \item 精修不是不能做，而是要更谨慎地花预算
+\end{itemize}
+
+因此，这种\textbf{凸成本}鼓励的不是“永远少算”，而是：
+
+\begin{quote}
+    先把基础步数花掉没关系，但最后那些昂贵的额外步数，只留给真正值得的样本。
+\end{quote}
+
+\subsection{当前常见成本参数}
+
+\begin{itemize}
+    \item \texttt{reward\_cost\_c0 = 0.2}
+    \item \texttt{reward\_cost\_c1 = 0.8}
+    \item \texttt{reward\_cost\_gamma = 2.0}
+    \item \texttt{reward\_lambda\_c = 0.4}
+\end{itemize}
+
+它们分别控制：
+
+\begin{itemize}
+    \item 每一步都有的基础成本
+    \item 随步数增长而增加的附加成本
+    \item 后期成本增加得有多快
+    \item 最终成本在总奖励里占多大比重
+\end{itemize}
+
+\section{把整个奖励函数串起来看}
+
+如果把前面的内容全部合起来，你可以把当前实现理解成下面这个流程。
+
+\subsection{第 1 步：准备三条路径}
+
+\begin{itemize}
+    \item 当前调度路径 \texttt{current}
+    \item 低预算锚点 \texttt{anchor\_lo}
+    \item 高质量锚点 \texttt{anchor\_hi}
+\end{itemize}
+
+\subsection{第 2 步：把动作解析成语义部件}
+
+\begin{itemize}
+    \item 位置
+    \item 姿态
+    \item 夹爪
+\end{itemize}
+
+\subsection{第 3 步：算两类误差}
+
+\begin{itemize}
+    \item 序列误差 $L_{\text{seq}}$
+    \item 趋势误差 $L_{\Delta}$
+\end{itemize}
+
+\subsection{第 4 步：分别做双锚点归一化}
+
+\begin{itemize}
+    \item 把当前误差放到“低锚点到高锚点”的坐标轴上
+    \item 得到归一化增益 $g$
+    \item 再乘以样本难度系数 $d$
+\end{itemize}
+
+\subsection{第 5 步：得到总质量}
+
+\begin{equation}
+    Q = Q_{\text{seq}} + Q_{\Delta}
+\end{equation}
+
+\subsection{第 6 步：扣除计算成本}
+
+\begin{equation}
+    R = Q - \lambda_c C(K)
+\end{equation}
+
+最终，\textbf{奖励越大，说明这条路径越值得}。
+
+\section{为什么这个奖励函数更容易学出“简单样本早停，困难样本多算”}
+
+这是整个设计最核心的价值。
+
+\subsection{原因一：不同样本有自己的比较坐标系}
+
+当前奖励不是直接比较绝对误差，而是比较：
+
+\begin{quote}
+    这个样本上，当前路径相对于低锚点和高锚点，处在什么位置。
+\end{quote}
+
+所以它天然更适合做\textbf{样本自适应}。
+
+\subsection{原因二：真正有提升空间的样本，会获得更高的质量收益权重}
+
+通过 difficulty 因子，系统会更重视那些“高锚点确实比低锚点好很多”的样本。
+
+这类样本本来就更值得多给预算。
+
+\subsection{原因三：后面的步数更贵}
+
+由于用了凸成本，越往后算越贵。于是模型不会轻易对所有样本一视同仁地一直多算，而是更可能把后期预算集中给真正困难的样本。
+
+\subsection{原因四：关键动作时刻更受关注}
+
+通过非均匀时间权重，模型更关心：
+
+\begin{itemize}
+    \item 动作变化明显的时刻
+    \item 夹爪事件发生的时刻
+\end{itemize}
+
+这能帮助它学会：
+
+\begin{quote}
+    关键阶段别太早停，不关键阶段可以更省一点。
+\end{quote}
+
+\section{它和设计稿的关系：哪些已经落地，哪些还没有完全落地}
+
+这一节很重要，避免你之后对着文档和代码时产生困惑。
+
+\subsection{已经明显落地的部分}
+
+\begin{itemize}
+    \item 从“绝对误差 - 步数成本”升级成“质量收益 - 成本”
+    \item 双锚点比较
+    \item 难度感知
+    \item 非均匀时间权重
+    \item 凸成本
+    \item 趋势项
+\end{itemize}
+
+\subsection{没有完全按设计稿原样落地的部分}
+
+\begin{itemize}
+    \item 设计稿强调过单独的“首帧项”
+    \item 当前代码没有显式的 $Q_{\text{first}}$
+    \item 当前实现采用的是：\textbf{跳过最初若干动作帧}，而不是单独计算首帧收益
+\end{itemize}
+
+所以你可以这样理解：
+
+\begin{quote}
+    当前代码是在设计稿思想上的一个务实版本，保留了核心方向，但没有把所有公式逐项一比一实现。
+\end{quote}
+
+\section{训练时奖励如何真正驱动 scheduler 更新}
+
+奖励函数本身只是打分器。真正训练时，还要把这个分数变成梯度信号。
+
+当前训练器里的核心过程是：
+
+\begin{enumerate}
+    \item 先 rollout 出一条当前路径
+    \item 再计算这条路径的 reward
+    \item 用 EMA 基线算 advantage
+    \item 再用 REINFORCE 或 PPO 去更新 scheduler
+\end{enumerate}
+
+\subsection{为什么要有 baseline}
+
+训练里不会直接用 reward，而是用：
+
+\begin{equation}
+    A = R - R_{\text{baseline}}
+\end{equation}
+
+这里 baseline 常用 EMA，也就是历史奖励的指数滑动平均。
+
+直觉上，advantage 在问：
+
+\begin{quote}
+    这次表现，比系统最近的平均水平更好还是更差？
+\end{quote}
+
+如果比平均水平好，就鼓励当前这条路径的决策。
+
+如果比平均水平差，就抑制当前这条路径的决策。
+
+\subsection{为什么不用 reward 直接更新}
+
+因为 reward 直接波动可能很大。减去 baseline 后，训练更稳定，方差更小，更容易学。
+
+\section{当前关键参数，小白该怎么理解}
+
+下面是当前奖励函数最关键的一批参数，以及最直观的理解方式。
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.30\textwidth} >{\raggedright\arraybackslash}p{0.16\textwidth} >{\raggedright\arraybackslash}p{0.42\textwidth}}
+\toprule
+参数 & 常见值 & 小白理解 \\
+\midrule
+\endhead
+\texttt{reward\_anchor\_lo\_k} & 4 & 便宜方案的固定步数参考线 \\
+\texttt{reward\_anchor\_hi\_k} & 25 & 高质量方案的固定步数参考线 \\
+\texttt{reward\_w\_seq} & 0.7 & 序列质量项权重 \\
+\texttt{reward\_w\_delta} & 0.3 & 趋势质量项权重 \\
+\texttt{reward\_lambda\_neg} & 1.0 & 当前比低锚点还差时，罚多重 \\
+\texttt{reward\_lambda\_c} & 0.4 & 成本项在总奖励里有多重 \\
+\texttt{reward\_pos\_weight} & 1.0 & 序列项里位置误差权重 \\
+\texttt{reward\_rot\_weight} & 0.6 & 序列项里姿态误差权重 \\
+\texttt{reward\_gripper\_weight} & 0.8 & 序列项里夹爪误差权重 \\
+\texttt{reward\_delta\_pos\_weight} & 1.0 & 趋势项里位置变化误差权重 \\
+\texttt{reward\_delta\_rot\_weight} & 0.2 & 趋势项里姿态变化误差权重 \\
+\texttt{reward\_delta\_gripper\_weight} & 0.6 & 趋势项里夹爪变化误差权重 \\
+\texttt{reward\_gap\_epsilon} & $10^{-4}$ & 防止双锚点 gap 太小导致除零或数值不稳 \\
+\texttt{reward\_difficulty\_kappa} & 0.1 & 难度系数平滑项 \\
+\texttt{reward\_skip\_initial\_action\_frames} & 1 & 开头多少帧不纳入奖励 \\
+\texttt{reward\_time\_rho} & 0.08 & 时间衰减速度 \\
+\texttt{reward\_time\_eta\_motion} & 0.6 & 大运动时刻额外加权强度 \\
+\texttt{reward\_time\_eta\_gripper} & 1.2 & 夹爪事件时刻额外加权强度 \\
+\texttt{reward\_time\_eta\_early} & 0.0 & 是否额外偏爱很早的时刻 \\
+\texttt{reward\_cost\_c0} & 0.2 & 单步基础成本 \\
+\texttt{reward\_cost\_c1} & 0.8 & 随步数增长的附加成本幅度 \\
+\texttt{reward\_cost\_gamma} & 2.0 & 后期成本变贵的速度 \\
+\bottomrule
+\end{longtable}
+
+\section{如果你只记住三个核心直觉}
+
+如果前面信息很多，你先记住下面三句话就够了。
+
+\subsection{直觉一：不是看“绝对好不好”，而是看“相对锚点值不值”}
+
+当前路径不是直接跟真值比一次就结束，而是要看：
+
+\begin{quote}
+    相对于便宜方案和高质量方案，它处在什么位置。
+\end{quote}
+
+\subsection{直觉二：不是所有误差都一样，也不是所有时刻都一样}
+
+位置、姿态、夹爪的重要性不同；平稳时刻、剧烈运动时刻、夹爪变化时刻的重要性也不同。
+
+\subsection{直觉三：不是每一步都一样贵，后面的步数更贵}
+
+所以系统会更倾向于：
+
+\begin{quote}
+    前面基础步数可以给，后面的精修步数要留给真正值得的样本。
+\end{quote}
+
+\section{一个非常直观的小例子}
+
+假设有一个样本：
+
+\begin{itemize}
+    \item 用 4 步时，动作质量一般
+    \item 用 25 步时，动作质量明显提升
+\end{itemize}
+
+现在 scheduler 采样出一条当前路径，最后用了 10 步。
+
+这时奖励函数会怎么想？
+
+\begin{enumerate}
+    \item 先看 10 步结果和 4 步结果比，是不是明显更像专家。
+    \item 再看 10 步结果离 25 步结果还有多远。
+    \item 如果 10 步已经恢复了大部分质量，那说明这 10 步花得值。
+    \item 然后再扣掉 10 步的计算成本。
+\end{enumerate}
+
+如果最后得到的奖励比较大，训练就会倾向于鼓励“在这种状态下停在类似 10 步的位置”。
+
+再看另一个样本：
+
+\begin{itemize}
+    \item 4 步和 25 步几乎没差别
+\end{itemize}
+
+那当前路径即便多算很多步，也未必能得到多少额外质量收益，反而要支付更多成本。这样奖励函数就会自然倾向于让它早点停。
+
+这就是“简单样本早停，困难样本多算”的直观来源。
+
+\section{当前实现的优点与局限}
+
+\subsection{优点}
+
+\begin{itemize}
+    \item 比单纯的绝对 action loss 更有语义
+    \item 比统一固定步数更容易支持样本自适应
+    \item 双锚点让 reward 更有可解释性
+    \item 凸成本更符合预算分配直觉
+    \item 时间权重让关键阶段更受重视
+\end{itemize}
+
+\subsection{局限}
+
+\begin{itemize}
+    \item 当前没有显式的首帧质量项
+    \item 双锚点质量本身也依赖 anchor 选得是否合理
+    \item 如果参数权重设置不好，仍然可能出现过度省算或过度追求质量
+    \item 奖励函数再精细，也只是训练信号的一部分，最终效果还受 rollout 稳定性、scheduler 结构、PPO/REINFORCE 配置等影响
+\end{itemize}
+
+\section{最后总结}
+
+当前项目中的奖励函数，本质上是在做这样一件事：
+
+\begin{quote}
+    对每个样本，先用低预算锚点和高质量锚点建立一个“这题值不值得多算”的坐标系，再从序列正确性、动作趋势正确性和关键时间片重要性几个角度衡量当前路径恢复了多少质量，最后扣掉一个后期越来越贵的计算成本。
+\end{quote}
+
+因此，它相比旧式的“绝对误差 - 线性成本”，更适合驱动 Hazard Scheduler 学到：
+
+\begin{itemize}
+    \item 简单样本早点停
+    \item 困难样本多给步数
+    \item 关键阶段别太省
+    \item 非关键阶段尽量省
+\end{itemize}
+
+如果你只用一句最朴素的话去记它，可以记成：
+
+\begin{quote}
+    \textbf{这个奖励函数不是在问“你到底好不好”，而是在问“为了这点质量提升，你这几步花得值不值”。}
+\end{quote}
+
+\end{document}

@@ -488,8 +488,6 @@ def eval_policy(task_name,
     save_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'metrics' / task_name
     save_dir.mkdir(parents=True, exist_ok=True)
     episodes_jsonl_path = save_dir / 'episodes.jsonl'
-    if episodes_jsonl_path.exists():
-        episodes_jsonl_path.unlink()
 
     now_id = 0
     succ_seed = 0
@@ -499,21 +497,59 @@ def eval_policy(task_name,
     scheduler_total_runtime_ms = []
     scheduler_video_runtime_ms = []
     scheduler_action_runtime_ms = []
-
+    runtime_retry_limit = int(args.get("runtime_retry_limit", 3))
 
     now_seed = st_seed
     clear_cache_freq = args["clear_cache_freq"]
+
+    if episodes_jsonl_path.exists():
+        existing_records = []
+        with open(episodes_jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                existing_records.append(json.loads(line))
+
+        if existing_records:
+            TASK_ENV.suc = int(sum(1 for r in existing_records if bool(r.get("success", False))))
+            TASK_ENV.test_num = int(len(existing_records))
+            now_id = int(len(existing_records))
+            succ_seed = int(len(existing_records))
+            now_seed = int(existing_records[-1].get("seed", st_seed - 1)) + 1
+
+            for record in existing_records:
+                for chunk in record.get("scheduler_chunks", []):
+                    if chunk.get("mode") is not None:
+                        scheduler_modes.add(str(chunk["mode"]))
+                    if chunk.get("video_steps_used") is not None:
+                        scheduler_video_steps.append(float(chunk["video_steps_used"]))
+                    if chunk.get("total_runtime_ms") is not None:
+                        scheduler_total_runtime_ms.append(float(chunk["total_runtime_ms"]))
+                    if chunk.get("video_runtime_ms") is not None:
+                        scheduler_video_runtime_ms.append(float(chunk["video_runtime_ms"]))
+                    if chunk.get("action_runtime_ms") is not None:
+                        scheduler_action_runtime_ms.append(float(chunk["action_runtime_ms"]))
+
+            print(
+                f"Resume existing task results: task={task_name} "
+                f"done={TASK_ENV.test_num}/{test_num} succ={TASK_ENV.suc}"
+            )
+            if TASK_ENV.test_num >= test_num:
+                return now_seed, TASK_ENV.suc
 
     args["eval_mode"] = True
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
         args["render_freq"] = 0
+        expert_episode_passed = not expert_check
 
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
+                expert_episode_passed = bool(TASK_ENV.plan_success and TASK_ENV.check_success())
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
@@ -528,7 +564,7 @@ def eval_policy(task_name,
                 traceback.print_exc()
                 continue
 
-        if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
+        if expert_episode_passed:
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
@@ -538,191 +574,213 @@ def eval_policy(task_name,
 
         args["render_freq"] = render_freq
 
-        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
-        TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+        episode_retry_count = 0
+        while True:
+            try:
+                TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+                episode_info_list = [episode_info["info"]]
+                results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+                instruction = np.random.choice(results[0][instruction_type])
+                TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
-        current_eval_video_file = None
-        raw_video_dir = None
-        original_eval_video_path = TASK_ENV.eval_video_path
-        if original_eval_video_path is not None:
-            raw_video_dir = Path(original_eval_video_path)
-            raw_success_exists = outcome_video_path(raw_video_dir, True).exists()
-            raw_failure_exists = outcome_video_path(raw_video_dir, False).exists()
-        else:
-            raw_success_exists = False
-            raw_failure_exists = False
+                current_eval_video_file = None
+                raw_video_dir = None
+                original_eval_video_path = TASK_ENV.eval_video_path
+                if original_eval_video_path is not None:
+                    raw_video_dir = Path(original_eval_video_path)
+                    raw_success_exists = outcome_video_path(raw_video_dir, True).exists()
+                    raw_failure_exists = outcome_video_path(raw_video_dir, False).exists()
+                else:
+                    raw_success_exists = False
+                    raw_failure_exists = False
 
-        if original_eval_video_path is not None and not (raw_success_exists and raw_failure_exists):
-            current_eval_video_file = Path(original_eval_video_path) / f"episode{TASK_ENV.test_num}.mp4"
-            ffmpeg = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "rawvideo",
-                    "-pixel_format",
-                    "rgb24",
-                    "-video_size",
-                    video_size,
-                    "-framerate",
-                    "10",
-                    "-i",
-                    "-",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-vcodec",
-                    "libx264",
-                    "-crf",
-                    "23",
-                    str(current_eval_video_file),
-                ],
-                stdin=subprocess.PIPE,
-            )
-            TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
-        else:
-            TASK_ENV.eval_video_path = None
+                if original_eval_video_path is not None and not (raw_success_exists and raw_failure_exists):
+                    current_eval_video_file = Path(original_eval_video_path) / f"episode{TASK_ENV.test_num}.mp4"
+                    ffmpeg = subprocess.Popen(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-loglevel",
+                            "error",
+                            "-f",
+                            "rawvideo",
+                            "-pixel_format",
+                            "rgb24",
+                            "-video_size",
+                            video_size,
+                            "-framerate",
+                            "10",
+                            "-i",
+                            "-",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-vcodec",
+                            "libx264",
+                            "-crf",
+                            "23",
+                            str(current_eval_video_file),
+                        ],
+                        stdin=subprocess.PIPE,
+                    )
+                    TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
+                else:
+                    TASK_ENV.eval_video_path = None
 
-        succ = False
+                succ = False
 
-        prompt = TASK_ENV.get_instruction()
-        ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
-        
-        first = True
-        full_obs_list = []
-        gen_video_list = []
-        full_action_history = []
-        episode_chunk_scheduler = []
+                prompt = TASK_ENV.get_instruction()
+                ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
+                
+                first = True
+                full_obs_list = []
+                gen_video_list = []
+                full_action_history = []
+                episode_chunk_scheduler = []
 
-        initial_obs = TASK_ENV.get_obs() 
-        inint_eef_pose = initial_obs['endpose']['left_endpose'] + \
-        [initial_obs['endpose']['left_gripper']] + \
-        initial_obs['endpose']['right_endpose'] + \
-        [initial_obs['endpose']['right_gripper']]
-        inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
-        initial_formatted_obs = format_obs(initial_obs, prompt)
-        full_obs_list.append(initial_formatted_obs)
-        first_obs = None
-        while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
-            if first:
-                observation = TASK_ENV.get_obs()
-                first_obs = format_obs(observation, prompt)
+                initial_obs = TASK_ENV.get_obs() 
+                inint_eef_pose = initial_obs['endpose']['left_endpose'] + \
+                [initial_obs['endpose']['left_gripper']] + \
+                initial_obs['endpose']['right_endpose'] + \
+                [initial_obs['endpose']['right_gripper']]
+                inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
+                initial_formatted_obs = format_obs(initial_obs, prompt)
+                full_obs_list.append(initial_formatted_obs)
+                first_obs = None
+                while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
+                    if first:
+                        observation = TASK_ENV.get_obs()
+                        first_obs = format_obs(observation, prompt)
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization)) #(TASK_ENV, model, observation)
-            action = ret['action']
-            scheduler_meta = ret.get('scheduler_meta')
-            if isinstance(scheduler_meta, dict):
-                chunk_meta = dict(scheduler_meta)
-                chunk_meta["chunk_index"] = int(len(episode_chunk_scheduler))
-                chunk_meta["take_action_cnt_before_chunk"] = int(TASK_ENV.take_action_cnt)
-                chunk_meta["action_chunk_frames"] = int(action.shape[1])
-                chunk_meta["action_steps_per_frame"] = int(action.shape[2])
-                episode_chunk_scheduler.append(chunk_meta)
-                if scheduler_meta.get('mode') is not None:
-                    scheduler_modes.add(str(scheduler_meta['mode']))
-                if scheduler_meta.get('video_steps_used') is not None:
-                    scheduler_video_steps.append(float(scheduler_meta['video_steps_used']))
-                if scheduler_meta.get('total_runtime_ms') is not None:
-                    scheduler_total_runtime_ms.append(float(scheduler_meta['total_runtime_ms']))
-                if scheduler_meta.get('video_runtime_ms') is not None:
-                    scheduler_video_runtime_ms.append(float(scheduler_meta['video_runtime_ms']))
-                if scheduler_meta.get('action_runtime_ms') is not None:
-                    scheduler_action_runtime_ms.append(float(scheduler_meta['action_runtime_ms']))
-            if 'video' in ret:
-                imagined_video = ret['video']
-                gen_video_list.append(imagined_video)
-            key_frame_list = []
+                    ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization))
+                    action = ret['action']
+                    scheduler_meta = ret.get('scheduler_meta')
+                    if isinstance(scheduler_meta, dict):
+                        chunk_meta = dict(scheduler_meta)
+                        chunk_meta["chunk_index"] = int(len(episode_chunk_scheduler))
+                        chunk_meta["take_action_cnt_before_chunk"] = int(TASK_ENV.take_action_cnt)
+                        chunk_meta["action_chunk_frames"] = int(action.shape[1])
+                        chunk_meta["action_steps_per_frame"] = int(action.shape[2])
+                        episode_chunk_scheduler.append(chunk_meta)
+                        if scheduler_meta.get('mode') is not None:
+                            scheduler_modes.add(str(scheduler_meta['mode']))
+                        if scheduler_meta.get('video_steps_used') is not None:
+                            scheduler_video_steps.append(float(scheduler_meta['video_steps_used']))
+                        if scheduler_meta.get('total_runtime_ms') is not None:
+                            scheduler_total_runtime_ms.append(float(scheduler_meta['total_runtime_ms']))
+                        if scheduler_meta.get('video_runtime_ms') is not None:
+                            scheduler_video_runtime_ms.append(float(scheduler_meta['video_runtime_ms']))
+                        if scheduler_meta.get('action_runtime_ms') is not None:
+                            scheduler_action_runtime_ms.append(float(scheduler_meta['action_runtime_ms']))
+                    if 'video' in ret:
+                        imagined_video = ret['video']
+                        gen_video_list.append(imagined_video)
+                    key_frame_list = []
 
-            assert action.shape[2] % 4 == 0
-            action_per_frame = action.shape[2] // 4
+                    assert action.shape[2] % 4 == 0
+                    action_per_frame = action.shape[2] // 4
 
-            start_idx = 1 if first else 0
-            for i in range(start_idx, action.shape[1]):
-                for j in range(action.shape[2]):
-                    raw_action_step = action[:, i, j].flatten() 
-                    full_action_history.append(raw_action_step)
+                    start_idx = 1 if first else 0
+                    for i in range(start_idx, action.shape[1]):
+                        for j in range(action.shape[2]):
+                            raw_action_step = action[:, i, j].flatten() 
+                            full_action_history.append(raw_action_step)
 
-                    ee_action = action[:, i, j]
-                    if action.shape[0] == 14:
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                            ee_action[6:10],
-                            euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                            ee_action[13:14]
-                        ])
-                    elif action.shape[0] == 16:
-                        ee_action =  add_init_pose(ee_action, inint_eef_pose)
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
-                            ee_action[7:11],
-                            ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
-                            ee_action[15:16]
-                        ])
+                            ee_action = action[:, i, j]
+                            if action.shape[0] == 14:
+                                ee_action = np.concatenate([
+                                    ee_action[:3],
+                                    euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                                    ee_action[6:10],
+                                    euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                                    ee_action[13:14]
+                                ])
+                            elif action.shape[0] == 16:
+                                ee_action =  add_init_pose(ee_action, inint_eef_pose)
+                                ee_action = np.concatenate([
+                                    ee_action[:3],
+                                    ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                                    ee_action[7:11],
+                                    ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                                    ee_action[15:16]
+                                ])
+                            else:
+                                raise NotImplementedError
+                            TASK_ENV.take_action(ee_action, action_type='ee')
+                           
+                            if (j+1) % action_per_frame == 0:
+                                obs = format_obs(TASK_ENV.get_obs(), prompt)
+                                full_obs_list.append(obs)
+                                key_frame_list.append(obs)
+                            
+                    first = False
+
+                    model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+          
+                    if TASK_ENV.eval_success:
+                        succ = True
+                        break
+
+                vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                if current_eval_video_file is not None:
+                    TASK_ENV._del_eval_video_ffmpeg()
+
+                vis_target = outcome_video_path(vis_dir, succ)
+                if vis_target.exists():
+                    print(f"Skip visualization video for {'success' if succ else 'failure'}: {vis_target}")
+                else:
+                    save_comparison_video(
+                        real_obs_list=full_obs_list,
+                        imagined_video=None,
+                        action_history=full_action_history,
+                        save_path=str(vis_target),
+                        fps=15
+                    )
+
+                if current_eval_video_file is not None and current_eval_video_file.exists():
+                    raw_target = outcome_video_path(raw_video_dir, succ)
+                    if raw_target.exists():
+                        current_eval_video_file.unlink()
+                        print(f"Delete duplicate raw video: {current_eval_video_file}")
                     else:
-                        raise NotImplementedError
-                    TASK_ENV.take_action(ee_action, action_type='ee')
-                   
-                    if (j+1) % action_per_frame == 0:
-                        obs = format_obs(TASK_ENV.get_obs(), prompt)
-                        full_obs_list.append(obs)
-                        key_frame_list.append(obs)
-                    
-            first = False
+                        current_eval_video_file.replace(raw_target)
+                        print(f"Keep raw video: {raw_target}")
 
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
-  
-            if TASK_ENV.eval_success:
-                succ = True
+                TASK_ENV.eval_video_path = original_eval_video_path
+
+                if succ:
+                    TASK_ENV.suc += 1
+                    print("\033[92mSuccess!\033[0m")
+                else:
+                    print("\033[91mFail!\033[0m")
+
+                now_id += 1
+                TASK_ENV.close_env(clear_cache=True)
+
+                if TASK_ENV.render_freq and getattr(TASK_ENV, "viewer", None) is not None:
+                    TASK_ENV.viewer.close()
+
+                TASK_ENV.test_num += 1
                 break
-      
-
-        vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        if current_eval_video_file is not None:
-            TASK_ENV._del_eval_video_ffmpeg()
-
-        vis_target = outcome_video_path(vis_dir, succ)
-        if vis_target.exists():
-            print(f"Skip visualization video for {'success' if succ else 'failure'}: {vis_target}")
-        else:
-            save_comparison_video(
-                real_obs_list=full_obs_list,
-                imagined_video=None, #gen_video_list,
-                action_history=full_action_history,
-                save_path=str(vis_target),
-                fps=15 # Suggest adjusting fps based on simulation step
-            )
-
-        if current_eval_video_file is not None and current_eval_video_file.exists():
-            raw_target = outcome_video_path(raw_video_dir, succ)
-            if raw_target.exists():
-                current_eval_video_file.unlink()
-                print(f"Delete duplicate raw video: {current_eval_video_file}")
-            else:
-                current_eval_video_file.replace(raw_target)
-                print(f"Keep raw video: {raw_target}")
-
-        TASK_ENV.eval_video_path = original_eval_video_path
-
-        if succ:
-            TASK_ENV.suc += 1
-            print("\033[92mSuccess!\033[0m")
-        else:
-            print("\033[91mFail!\033[0m")
-
-        now_id += 1
-        TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
-
-        if TASK_ENV.render_freq:
-            TASK_ENV.viewer.close()
-
-        TASK_ENV.test_num += 1
+            except Exception as e:
+                err_msg = str(e).lower()
+                try:
+                    if getattr(TASK_ENV, "eval_video_ffmpeg", None):
+                        TASK_ENV._del_eval_video_ffmpeg()
+                except Exception:
+                    pass
+                try:
+                    TASK_ENV.close_env(clear_cache=True)
+                except Exception:
+                    pass
+                args["render_freq"] = render_freq
+                episode_retry_count += 1
+                print(f"episode runtime error (retry {episode_retry_count}/{runtime_retry_limit}): {e}")
+                traceback.print_exc()
+                if "cannot create buffer" in err_msg and episode_retry_count < runtime_retry_limit:
+                    TASK_ENV = class_decorator(args["task_name"])
+                    continue
+                raise
 
         episode_record = {
           "episode_index": int(TASK_ENV.test_num - 1),

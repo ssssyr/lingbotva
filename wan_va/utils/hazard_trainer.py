@@ -382,8 +382,17 @@ class HazardTrainer:
 
         world_size = float(dist.get_world_size())
         for param in self.scheduler_head.parameters():
-            if param.grad is None:
+            if not param.requires_grad:
                 continue
+
+            # IMPORTANT: all ranks must execute the exact same collective sequence.
+            # Some scheduler parameters can legitimately receive no gradient on a
+            # given rank for a given rollout. If we `continue` here on only a
+            # subset of ranks, NCCL will see different tensor sizes / different
+            # collective order and eventually deadlock / timeout.
+            if param.grad is None:
+                param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
             param.grad.div_(world_size)
 

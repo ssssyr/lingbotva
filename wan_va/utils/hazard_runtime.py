@@ -494,6 +494,7 @@ class HazardRolloutRunner:
         sigma_next_history = []
         jump_ratio_history = []
         jump_distance_history = []
+        executed_video_steps = 0
         sigma_cur = float(self.video_scheduler.sigmas[0].item())
 
         for step_idx in range(self.K_max):
@@ -549,6 +550,7 @@ class HazardRolloutRunner:
                 "should_stop": bool(scheduler_result["should_stop"]),
                 "forced_stop": bool(scheduler_result["forced_stop"]),
                 "forced_continue": bool(scheduler_result["forced_continue"]),
+                "forced_terminal": bool(scheduler_result.get("forced_terminal", False)),
                 "stop_action": bool(scheduler_result["should_stop"]),
                 "H_cumulative": scheduler_result["H_cumulative"],
                 "sigma_cur": float(scheduler_result["sigma_cur"]),
@@ -576,10 +578,12 @@ class HazardRolloutRunner:
                 )
                 if latent_cond is not None:
                     latents[:, :, 0:1] = latent_cond[:, :, 0:1]
+            executed_video_steps += 1
             sigma_cur = sigma_next
+            if scheduler_result.get("forced_terminal", False):
+                break
 
-        executed_video_steps = len(trajectory)
-        terminal_sigma = float(sigma_cur_history[-1]) if sigma_cur_history else float(sigma_cur)
+        terminal_sigma = float(sigma_cur)
         terminal_equivalent_steps = self._approx_equivalent_fixed_steps(terminal_sigma)
 
         with torch.no_grad():
@@ -610,7 +614,7 @@ class HazardRolloutRunner:
             trajectory=trajectory,
             final_action=final_action,
             video_steps=int(executed_video_steps),
-            stop_step=int(executed_video_steps),
+            stop_step=int(len(trajectory)),
             final_hazard=float(final_hazard),
             final_stop_prob=float(final_stop_prob),
             executed_video_steps=int(executed_video_steps),

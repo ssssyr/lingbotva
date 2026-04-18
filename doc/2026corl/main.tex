@@ -1,0 +1,215 @@
+\documentclass{article}
+
+% Official CoRL 2026 submission template.
+\usepackage{corl_2026} % Use this for the initial submission.
+% \usepackage[final]{corl_2026} % Uncomment for the camera-ready final version.
+% \usepackage[preprint]{corl_2026} % Uncomment for preprints such as arXiv.
+\usepackage{CJKutf8}
+
+\title{面向视频到动作扩散机器人策略的自适应噪声调度\\中文大纲版}
+% NOTE: authors are shown only in the final or preprint versions.
+\author{
+  % Author One \\
+  % Affiliation \\
+  % Address \\
+  % \texttt{email} \\
+  % \And
+  % Author Two \\
+  % Affiliation \\
+  % Address \\
+  % \texttt{email} \\
+}
+
+\begin{document}
+\begin{CJK*}{UTF8}{gbsn}
+
+\maketitle
+
+\begin{abstract}
+待写要点：说明视频到动作扩散机器人策略中的固定噪声调度问题；指出不同状态对视频去噪预算的需求并不一致；概括本文提出的累计 Hazard 停止控制与相对 jump 噪声推进；总结路径级质量--代价优化与整体实验结论。
+\end{abstract}
+
+\keywords{机器人学习, 扩散策略, 自适应噪声调度, Hazard 停止控制, 跳步调度}
+
+\section{引言}
+
+\begin{itemize}
+  \item 交代研究背景：视频到动作扩散式机器人策略在复杂操作任务上有效，但视频分支推理成本高，固定噪声步数会直接决定系统时延。
+  \item 提出核心问题：统一的固定调度无法根据状态难度、任务复杂度和当前去噪进展自适应分配计算预算。
+  \item 说明现有不足：只做固定步数推理会造成浪费；只做早停无法回答“若继续，应再推进多远”；纯离散 step 选择不够自然，难以表达剩余噪声空间中的相对推进。
+  \item 给出本文思路：把视频分支的噪声调度建模为顺序决策问题，同时学习“现在是否停止”和“继续时应该跳多远”。
+  \item 提前概括方法：使用累计 Hazard 建模稳定的停止控制，使用相对 jump 比例建模继续动作，并以路径级动作质量与计算代价联合优化调度策略。
+  \item 提前概括实验：围绕 RobotWin 全量任务验证自适应调度在成功率、平均视频步数和视频时延上的效果--效率权衡优势。
+  \item 列出贡献：提出统一调度框架；提出累计 Hazard 停止与相对 jump 推进的联合建模；验证自适应噪声调度在机器人策略推理中的价值。
+\end{itemize}
+
+\section{相关工作}
+
+\begin{itemize}
+  \item 扩散式机器人策略与视频到动作建模：概述视频预测、动作生成和共享主干建模在机器人策略学习中的发展。
+  \item 扩散采样加速与学习式调度：回顾固定 schedule、学习式 sampling policy、早停和步长控制等方向。
+  \item 自适应计算与 early exit：回顾动态预算分配、条件计算和状态依赖推理控制的相关思想。
+  \item 强调本文位置：本文不是通用图像扩散加速，而是围绕机器人动作质量和任务成功率来学习视频分支的自适应噪声调度。
+  \item 强调方法差异：本文不是只预测一个停止时刻，而是联合学习 stop 和 jump，并在真实推理路径上优化质量与代价。
+\end{itemize}
+
+\section{方法}
+
+\subsection{问题设定}
+
+\begin{itemize}
+  \item 定义 LingBot-VA 中的视频分支调度问题：调度器在每个视频去噪决策点观察当前状态，并输出停止或继续的决策信号。
+  \item 明确优化目标：在保持动作质量和任务性能的前提下，减少视频分支的去噪预算与推理时延。
+  \item 说明训练边界：主干模型冻结，仅训练轻量 scheduler head，从而把收益明确归因到调度策略而非主干重训练。
+\end{itemize}
+
+\subsection{整体框架概览}
+
+\begin{itemize}
+  \item 给出整体 pipeline：视频分支逐步去噪，scheduler 读取 pooled feature 与当前噪声状态，决定 stop 或 jump，再将最终视频表征 handoff 给动作分支。
+  \item 说明状态设计：视频 hidden feature、当前噪声强度、已用预算以及可选任务条件共同构成调度状态。
+  \item 说明动作空间：统一策略同时包含停止控制和继续时的推进幅度控制，而不是单独学习某一个固定 cutoff。
+\end{itemize}
+
+\subsection{基于累计 Hazard 的停止控制}
+
+\begin{itemize}
+  \item 定义当前步 Hazard 增量、累计 Hazard、条件停止概率与累计停止趋势。
+  \item 说明为什么使用 Hazard：概率语义清晰、单调累积、数值稳定，并能避免停止信号在相邻步之间反复抖动。
+  \item 区分训练与部署：训练时保留 Bernoulli 采样以支持探索，部署时再用阈值规则转成确定性停止接口。
+  \item 说明与固定 cutoff 的区别：本文不直接监督“最佳停在第几步”，而是让模型通过路径奖励学会“什么时候值得停”。
+\end{itemize}
+
+\subsection{基于相对 Jump 的噪声推进}
+
+\begin{itemize}
+  \item 定义 continue 动作下的 jump ratio，并在剩余噪声空间而非离散 step 空间中更新下一步噪声强度。
+  \item 说明参数化方式：用可控的 mode 与 concentration 表示 jump 分布，使部署期能稳定地使用确定性 mode。
+  \item 说明设计动机：相对 jump 比离散 step 分类更自然，也更适合表达“还剩多少噪声需要保留或压缩”。
+  \item 说明与 stop 的关系：stop 决定是否结束当前路径，jump 决定继续时的推进幅度，两者共同构成统一调度策略。
+\end{itemize}
+
+\subsection{路径级奖励设计}
+
+\begin{itemize}
+  \item 强调路径级优化目标：评价的是整条视频调度路径是否值得，而不是单独评价某一步的局部选择。
+  \item 质量项计划说明：用动作序列质量和动作变化趋势质量共同刻画路径诱导的视频表征是否有利于动作预测。
+  \item 代价项计划说明：用视频计算开销刻画预算消耗，并通过权重或非线性成本控制效果--效率平衡。
+  \item 说明奖励设计的写法重点：强调“把预算花在更值得的状态上”，而不是写成单纯的启发式加权和。
+\end{itemize}
+
+\subsection{策略优化与正则化}
+
+\begin{itemize}
+  \item 说明为何采用路径级策略优化：stop 和 jump 都是离散或随机决策，直接标签监督并不能自然刻画整条路径价值。
+  \item 说明路径概率：停止概率与 jump 分布共同决定整条调度轨迹的采样概率。
+  \item 说明 KL 或 reference schedule 的作用：限制策略过快偏离合理固定调度，稳定训练早期探索。
+  \item 说明本文主线：训练的是调度策略，不改动主干 backbone，因此方法贡献聚焦于噪声调度本身。
+\end{itemize}
+
+\subsection{训练与部署细节}
+
+\begin{itemize}
+  \item 训练期：如何采样 stop/continue、如何采样 jump、如何计算奖励以及如何缓存旧策略信息。
+  \item 部署期：如何使用确定性 stop 规则和 jump mode，如何把最终 video state handoff 到动作分支。
+  \item 需要明确记录的超参数：例如 $K_{\min}$、$K_{\max}$、$\eta$、$\sigma_{\min}$、KL 权重和成本权重。
+\end{itemize}
+
+\section{实验}
+
+\subsection{实验设置}
+
+\begin{itemize}
+  \item 说明基座模型、训练配置和冻结策略，明确只有 scheduler 参与训练。
+  \item 说明数据与任务范围，重点突出 RobotWin 全量任务评测。
+  \item 说明评测指标：任务成功率、平均视频去噪步数、等效固定步数、视频时延，以及必要的离线动作质量指标。
+  \item 说明 baseline 设计：与多个固定步数设置比较，并保持相同主干、相同动作分支和相同评测协议。
+\end{itemize}
+
+\subsection{主结果：全量 RobotWin 在线评测}
+
+\begin{itemize}
+  \item 主表重点展示：自适应调度在全量任务上的整体成功率。
+  \item 同时给出平均视频步数和平均视频时延，避免只讲速度不讲效果，或者只讲效果不讲效率。
+  \item 强调论文主结果应写成效果--效率联合结论，而不是拆成两张互相割裂的表。
+\end{itemize}
+
+\subsection{与固定步数 Baseline 的对比}
+
+\begin{itemize}
+  \item 系统比较不同固定步数下的成功率、步数与时延。
+  \item 说明固定高预算为什么浪费，固定低预算为什么会在困难状态下掉性能。
+  \item 突出自适应调度不是简单取某个中间固定步数，而是对不同状态做不同预算分配。
+\end{itemize}
+
+\subsection{效果--效率权衡分析}
+
+\begin{itemize}
+  \item 展示 success rate 与 runtime 或 video steps 的 tradeoff 曲线。
+  \item 解释不同任务或不同状态为何会触发不同的平均预算分配。
+  \item 用任务级统计说明：简单任务倾向更早停止，复杂任务倾向保留更多去噪预算。
+\end{itemize}
+
+\subsection{消融实验}
+
+\begin{itemize}
+  \item 比较 stop-only 与 stop+jump，验证统一调度的必要性。
+  \item 比较不同停止建模方式，验证累计 Hazard 的稳定性和收益。
+  \item 比较不同 jump 参数化或不同 reference regularization，分析哪部分设计真正带来提升。
+  \item 比较不同奖励项组合，验证质量项、趋势项和成本项分别发挥的作用。
+\end{itemize}
+
+\subsection{调度行为分析}
+
+\begin{itemize}
+  \item 展示 terminal sigma、平均 jump distance、平均 decision steps 等调度统计量。
+  \item 可视化典型轨迹，说明调度策略如何在不同任务阶段分配计算预算。
+  \item 分析策略是否学会了“难例多算、易例少算”的状态依赖行为。
+\end{itemize}
+
+\subsection{失败案例与误差分析}
+
+\begin{itemize}
+  \item 识别仍然表现不稳定的任务，分析问题更偏向感知困难、动作困难还是调度失误。
+  \item 区分典型失败模式：停得过早、跳得过远、预算分配不稳定、最终表征不足以支撑动作预测。
+  \item 说明这些失败模式如何为后续改进提供方向。
+\end{itemize}
+
+\section{局限性}
+
+\begin{itemize}
+  \item 当前实验主要集中在 RobotWin，跨数据域、跨模型主干和跨机器人平台的泛化能力还需要补充验证。
+  \item 当前训练设置冻结主干，因此本文主要回答“调度是否有效”，尚未回答“调度与表征联合优化是否更强”。
+  \item 当前部署仍依赖少量阈值型超参数，后续可以探索更少手工规则的决策接口。
+  \item 当前主要优化视频分支预算，尚未统一考虑整条系统链路中的所有开销来源。
+\end{itemize}
+
+\section{结论}
+
+\begin{itemize}
+  \item 回到问题本身：固定噪声调度不适合状态难度差异明显的机器人推理场景。
+  \item 总结核心方法：通过累计 Hazard 停止控制与相对 jump 噪声推进，学习状态依赖的自适应调度策略。
+  \item 总结核心发现：扩散式机器人策略的推理预算应该由状态决定，而不是由固定 schedule 决定。
+  \item 指出未来方向：可继续扩展到联合主干训练、更广泛基准和更完整的系统级预算优化。
+\end{itemize}
+
+% The acknowledgments block is included only in final and preprint versions.
+% \acknowledgments{}
+
+\bibliography{references}
+
+\appendix
+
+\section{附录规划}
+
+\begin{itemize}
+  \item 完整训练配置与超参数表。
+  \item 奖励函数与 reference schedule 的详细定义。
+  \item stop 与 jump 的路径概率、KL 和优化目标推导。
+  \item 全任务结果大表与更多任务级统计。
+  \item 典型调度轨迹、更多可视化与失败案例补充。
+  \item 复现细节、评测配置与推理部署说明。
+\end{itemize}
+
+\end{CJK*}
+\end{document}

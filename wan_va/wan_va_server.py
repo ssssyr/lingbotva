@@ -15,7 +15,7 @@ from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
@@ -85,6 +85,7 @@ class VA_Server:
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
+            attn_mode="torch"
         )
         self._init_hazard_runtime(transformer)
         shard_fn = shard_model
@@ -803,8 +804,11 @@ class VA_Server:
         latent_cond = self._get_latent_cond(frame_st_id)
         sigma_cur = float(self.scheduler.sigmas[0].item())
         sigma_history = []
+        sigma_next_history = []
         jump_ratio_history = []
         jump_distance_history = []
+        video_steps_used = 0
+        decision_steps_used = 0
 
         for _step_idx in range(hazard_k_max):
             t = self.scheduler.sigma_to_timestep(sigma_cur).to(device=self.device, dtype=torch.float32)
@@ -829,10 +833,17 @@ class VA_Server:
                 self._select_hazard_video_feature(video_pooled).detach(),
                 sigma_cur=sigma_cur,
             )
+            decision_steps_used += 1
             sigma_history.append(float(scheduler_result["sigma_cur"]))
+            sigma_next_history.append(
+                None if scheduler_result["sigma_next"] is None else float(scheduler_result["sigma_next"])
+            )
             if scheduler_result["jump_ratio"] is not None:
                 jump_ratio_history.append(float(scheduler_result["jump_ratio"].mean().item()))
                 jump_distance_history.append(float(scheduler_result["jump_distance"].mean().item()))
+            else:
+                jump_ratio_history.append(None)
+                jump_distance_history.append(None)
             if scheduler_result["should_stop"]:
                 break
 
@@ -844,22 +855,27 @@ class VA_Server:
                 sample=latents,
                 return_dict=False,
             )
+            video_steps_used += 1
             if latent_cond is not None:
                 latents[:, :, 0:1] = latent_cond
             sigma_cur = sigma_next
+            if scheduler_result.get("forced_terminal", False):
+                break
 
-        video_steps_used = int(hazard_scheduler.step_count)
-        terminal_sigma = float(sigma_history[-1]) if sigma_history else float(sigma_cur)
+        terminal_sigma = float(sigma_cur)
         refresh_t = self.scheduler.sigma_to_timestep(terminal_sigma)
         self._refresh_video_cache_exact(latents, refresh_t, frame_st_id=frame_st_id)
         self._sync_device()
         scheduler_meta = {
             "mode": "hazard_jump_v2",
-            "video_steps_used": video_steps_used,
+            "video_steps_used": int(video_steps_used),
+            "video_decision_steps_used": int(decision_steps_used),
             "video_steps_max": int(self.job_config.num_inference_steps),
             "video_steps_limit": int(hazard_k_max),
             "equivalent_fixed_steps": int(self.scheduler.approx_step_index(terminal_sigma) + 1),
             "terminal_sigma": terminal_sigma,
+            "sigma_history": sigma_history,
+            "sigma_next_history": sigma_next_history,
             "jump_ratio_history": jump_ratio_history,
             "jump_distance_history": jump_distance_history,
             "hazard_eta": float(getattr(self.job_config, "hazard_eta", 0.5)),
@@ -910,7 +926,7 @@ class VA_Server:
         action_timesteps = F.pad(
             action_timesteps,
             (0,
-             1),  # pad 1 element at the end (right side) of the last dimension
+             1),
             mode='constant',
             value=0)
 
@@ -1043,7 +1059,7 @@ class VA_Server:
         pred_latent_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents, _ = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)
@@ -1095,6 +1111,8 @@ def run(args):
         config.hazard_return_metadata = bool(args.hazard_return_metadata)
     if args.save_debug_artifacts is not None:
         config.save_debug_artifacts = bool(args.save_debug_artifacts)
+    if args.enable_offload is not None:
+        config.enable_offload = bool(args.enable_offload)
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1212,6 +1230,13 @@ def main():
         choices=[0, 1],
         default=None,
         help='whether to save per-chunk latents/actions/obs debug artifacts',
+    )
+    parser.add_argument(
+        "--enable-offload",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help='whether to offload VAE/text encoder auxiliary modules to CPU',
     )
     args = parser.parse_args()
     run(args)

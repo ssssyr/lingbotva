@@ -1,0 +1,26 @@
+save_root: "results/robotwin_hazard_final_eval5_20260416"
+task_name: "__all__"
+start_from_task: ""
+render_freq: 0
+test_num: 5
+
+policy_name: "ACT"
+task_config: "demo_clean"
+train_config_name: 0
+model_name: 0
+seed: 0
+gpu_id: 0
+port: 29056
+
+video_guidance_scale: 5
+action_guidance_scale: 1
+online_scheduler_mode: "hazard"
+fixed_video_steps: 25
+enable_hazard_scheduler_runtime: true
+hazard_checkpoint_path: "/mnt/sda/syr/train_out/robotwin_hazard_local_2gpu/runs/robotwin_hazard_local_2gpu_20260415_112542/checkpoints/hazard_scheduler_final.pt"
+hazard_eta: 0.8
+hazard_k_min: 3
+hazard_k_max: 25
+hazard_feature_source: "cond"
+hazard_return_metadata: true
+save_debug_artifacts: true

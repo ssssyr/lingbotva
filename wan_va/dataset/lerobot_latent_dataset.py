@@ -9,12 +9,16 @@ import os
 from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
-import time
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
-from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+
+from .action_transforms import (
+    get_relative_pose,
+    get_relative_xyz_action,
+    to_numpy_array,
+)
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -47,101 +51,32 @@ def construct_lerobot_multi_processor(config,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = sorted(v.split('/meta/info.json')[0] for v in repo_list)
-    dataset_repo_filters = getattr(config, 'dataset_repo_filters', None)
-    if dataset_repo_filters:
-        dataset_repo_filters = [str(v).strip() for v in dataset_repo_filters if str(v).strip()]
-        if dataset_repo_filters:
-            repo_list = [
-                repo_id for repo_id in repo_list
-                if any(pattern in repo_id for pattern in dataset_repo_filters)
-            ]
-    max_dataset_repos = getattr(config, 'max_dataset_repos', None)
-    if max_dataset_repos is not None:
-        max_dataset_repos = int(max_dataset_repos)
-        if max_dataset_repos > 0:
-            repo_list = repo_list[:max_dataset_repos]
-    num_repo = len(repo_list)
-    num_init_worker = max(1, min(int(num_init_worker), num_repo)) if num_repo else 1
-    print(
-        f"[dataset-init] discovered {num_repo} lerobot datasets under {config.dataset_path}",
-        flush=True,
-    )
-    print(
-        f"[dataset-init] using {num_init_worker} initialization workers",
-        flush=True,
-    )
-    if num_repo == 0:
-        print("[dataset-init] no datasets found", flush=True)
-        return datasets_out_lst
+    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
 
+    if len(repo_list) == 0:
+        return []
+
+    num_init_worker = max(1, min(num_init_worker, len(repo_list)))
     if num_init_worker == 1:
-        for idx, repo_id in enumerate(repo_list, start=1):
-            t0 = time.time()
-            print(
-                f"[dataset-init] ({idx}/{num_repo}) loading {repo_id}",
-                flush=True,
-            )
-            datasets_out_lst.append(construct_func(repo_id))
-            dt = time.time() - t0
-            print(
-                f"[dataset-init] ({idx}/{num_repo}) done in {dt:.1f}s",
-                flush=True,
-            )
-    else:
-        print(
-            "[dataset-init] multiprocessing init enabled; if startup stalls, retry with "
-            "LINGBOT_VA_INIT_WORKERS=1",
-            flush=True,
-        )
-        with Pool(num_init_worker) as pool:
-            datasets_out_lst = list(
-                tqdm(
-                    pool.imap(construct_func, repo_list),
-                    total=num_repo,
-                    desc='[dataset-init]',
-                    leave=False,
-                )
-            )
+        return [construct_func(repo_id) for repo_id in repo_list]
+
+    with Pool(num_init_worker) as pool:
+        datasets_out_lst = pool.map(construct_func, repo_list)
                 
     return datasets_out_lst
-
-def get_relative_pose(pose):
-    if torch.is_tensor(pose):
-        pose = pose.detach().cpu().numpy()
-    
-    rot = R.from_quat(pose[:, 3:7])
-    first_rot = R.from_quat(np.tile(pose[:1, 3:7], (pose.shape[0], 1)))
-    trans = pose[:, :3]
-    relative_trans = trans - trans[0:1]
-
-    relative_rot = first_rot.inv() * rot
-    relative_quat = relative_rot.as_quat()
-
-    relative_pose = np.concatenate([relative_trans, relative_quat], axis=1)
-    return torch.from_numpy(relative_pose)
 
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=None,
+        num_init_worker=128,
     ):
-        if num_init_worker is None:
-            num_init_worker = getattr(
-                config,
-                "init_worker",
-                getattr(config, "load_worker", 8),
-            )
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )
         self.item_id_to_dataset_id, self.acc_dset_num = (
             self._get_item_id_to_dataset_id()
         )
-        self.bucket_keys = []
-        for dset in self._datasets:
-            self.bucket_keys.extend(dset.bucket_keys)
 
     def __len__(
         self,
@@ -164,13 +99,9 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx) -> dict:
         assert idx < len(self)
-        dataset_id = self.item_id_to_dataset_id[idx]
-        cur_dset = self._datasets[dataset_id]
-        local_idx = idx - self.acc_dset_num[dataset_id]
-        out = cur_dset[local_idx]
-        out['global_index'] = int(idx)
-        out['source_dataset_id'] = int(dataset_id)
-        return out
+        cur_dset = self._datasets[self.item_id_to_dataset_id[idx]]
+        local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
+        return cur_dset[local_idx]
 
 class LatentLeRobotDataset(LeRobotDataset):
     def __init__(
@@ -224,12 +155,9 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def parse_meta(self):
         out = []
-        bucket_keys = []
         max_bucket_key = getattr(self.config, "max_bucket_key", None)
         if max_bucket_key is not None:
             max_bucket_key = int(max_bucket_key)
-            if max_bucket_key <= 0:
-                max_bucket_key = None
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
@@ -241,6 +169,11 @@ class LatentLeRobotDataset(LeRobotDataset):
                 }
                 cur_meta.update(acfg)
 
+                if max_bucket_key is not None:
+                    segment_length = int(cur_meta["end_frame"]) - int(cur_meta["start_frame"])
+                    if segment_length > max_bucket_key:
+                        continue
+
                 check_statu = self._check_meta(
                     cur_meta["start_frame"],
                     cur_meta["end_frame"],
@@ -248,15 +181,8 @@ class LatentLeRobotDataset(LeRobotDataset):
                 )
 
                 if check_statu:
-                    segment_length = cur_meta["end_frame"] - cur_meta["start_frame"]
-                    if max_bucket_key is not None and segment_length > max_bucket_key:
-                        continue
                     out.append(cur_meta)
-                    bucket_keys.append(
-                        segment_length
-                    )
         self.new_metas = out
-        self.bucket_keys = bucket_keys
 
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
@@ -336,11 +262,25 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
-        action = action[act_shift:]
-        if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
+        action = to_numpy_array(action[act_shift:])
+        if self.config.env_type == 'robotwin_tshape':
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
+        elif (
+            self.config.env_type == "none"
+            and getattr(self.config, "action_representation", "absolute")
+            == "relative_chunk_anchor"
+        ):
+            relative_action_base = getattr(
+                self.config, "relative_action_base", "chunk_anchor"
+            )
+            if relative_action_base != "chunk_anchor":
+                raise ValueError(
+                    "UR10 relative action processing only supports "
+                    f"relative_action_base='chunk_anchor', got {relative_action_base!r}"
+                )
+            action = get_relative_xyz_action(action)
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
@@ -358,6 +298,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
         action_aligned = (action_aligned - self.q01) / (
                 self.q99 - self.q01 + 1e-6) * 2. - 1.
+        action_aligned = np.clip(action_aligned, -1.5, 1.5)
         action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_aligned *= action_mask_aligned
@@ -385,15 +326,6 @@ class LatentLeRobotDataset(LeRobotDataset):
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
-        out_dict['sample_index'] = int(idx)
-        out_dict['episode_index'] = int(episode_index)
-        out_dict['local_start_frame'] = int(local_start_frame)
-        out_dict['local_end_frame'] = int(local_end_frame)
-        out_dict['dataset_repo_id'] = str(self.repo_id)
-        out_dict['state_uid'] = (
-            f"{self.repo_id}|episode_{episode_index:06d}|"
-            f"start_{local_start_frame}|end_{local_end_frame}"
-        )
         return out_dict
 
     def __len__(self):

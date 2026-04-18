@@ -18,6 +18,7 @@ import gymnasium as gym
 import toppra as ta
 import transforms3d as t3d
 from collections import OrderedDict
+import gc
 
 import sys
 import warnings
@@ -49,6 +50,7 @@ class Sapien_TEST(gym.Env):
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")
+            self.close()
         except:
             print("\033[31m" + "Render Error" + "\033[0m")
             exit()
@@ -75,6 +77,15 @@ class Sapien_TEST(gym.Env):
         # declare sapien scene
         scene_config = sapien.SceneConfig()
         self.scene = self.engine.create_scene(scene_config)
+
+    def close(self):
+        for attr in ["scene", "renderer", "engine"]:
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
+        gc.collect()
 
 
 if __name__ == "__main__":

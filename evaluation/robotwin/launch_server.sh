@@ -53,6 +53,7 @@ echo "  action_guidance_scale=${action_guidance_scale:-1}"
 echo "  online_scheduler_mode=${online_scheduler_mode:-fixed}"
 echo "  fixed_video_steps=${fixed_video_steps:-25}"
 echo "  enable_hazard_scheduler_runtime=${enable_hazard_scheduler_runtime:-false}"
+echo "  enable_offload=${enable_offload:-false}"
 if [[ -n "${hazard_checkpoint_path:-}" ]]; then
     echo "  hazard_checkpoint_path=${hazard_checkpoint_path}"
 fi
@@ -75,4 +76,5 @@ CUDA_VISIBLE_DEVICES=${gpu_id} python wan_va/wan_va_server.py \
     --hazard-k-max "${hazard_k_max:-25}" \
     --hazard-feature-source "${hazard_feature_source:-cond}" \
     --hazard-return-metadata "$([[ "${hazard_return_metadata_normalized}" == "true" ]] && echo 1 || echo 0)" \
-    --save-debug-artifacts "$([[ "$(echo "${save_debug_artifacts:-true}" | tr '[:upper:]' '[:lower:]')" == "true" ]] && echo 1 || echo 0)"
+    --save-debug-artifacts "$([[ "$(echo "${save_debug_artifacts:-true}" | tr '[:upper:]' '[:lower:]')" == "true" ]] && echo 1 || echo 0)" \
+    --enable-offload "$([[ "$(echo "${enable_offload:-false}" | tr '[:upper:]' '[:lower:]')" == "true" ]] && echo 1 || echo 0)"

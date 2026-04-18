@@ -13,9 +13,9 @@ paths:
   reference_model_path: /mnt/sda/syr/models/lingbot-va-posttrain-robotwin
 
 logging:
-  enable_wandb: false
+  enable_wandb: true
   wandb_project: va_robotwin_hazard
-  wandb_mode: offline
+  wandb_mode: online
   wandb_team_name: ""
   wandb_base_url: ""
   wandb_api_key: ""

@@ -1,10 +1,11 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import re
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
+import wandb
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,8 @@ from distributed.fsdp import shard_model, apply_ac
 from distributed.util import (
     _configure_model, 
     init_distributed, 
+    dist_mean, 
+    dist_max
 )
 from einops import rearrange
 from modules.utils import (
@@ -43,49 +46,24 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset
-from dataset import BucketedDistributedBatchSampler
 import gc
 
 
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            try:
-                import wandb
-            except ImportError as exc:
-                raise RuntimeError(
-                    "enable_wandb=True requires the `wandb` package. "
-                    "Install the post-training extras or disable WandB."
-                ) from exc
-
-            for env_name in ("WANDB_API_KEY", "WANDB_BASE_URL", "WANDB_TEAM_NAME"):
-                if os.environ.get(env_name) == "":
-                    os.environ.pop(env_name, None)
-
-            login_kwargs = {}
-            wandb_base_url = os.environ.get("WANDB_BASE_URL")
-            wandb_api_key = os.environ.get("WANDB_API_KEY")
-            wandb_mode = os.environ.get("WANDB_MODE", "online")
-            wandb_entity = os.environ.get("WANDB_TEAM_NAME") or None
-            if wandb_base_url:
-                login_kwargs["host"] = wandb_base_url
-            if wandb_api_key:
-                login_kwargs["key"] = wandb_api_key
-            if wandb_mode == "online" and login_kwargs:
-                wandb.login(**login_kwargs)
+            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
-            init_kwargs = dict(
+            self.wandb.init(
+                entity=os.environ["WANDB_TEAM_NAME"],
                 project=os.getenv("WANDB_PROJECT", "va_robotwin"),
+                # dir=log_dir,
                 config=config,
-                mode=wandb_mode,
-                name=os.getenv("WANDB_RUN_NAME", "robotwin_train"),
+                mode="online",
+                name='test_lln'
+                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
-            if wandb_entity:
-                init_kwargs["entity"] = wandb_entity
-            self.wandb.init(**init_kwargs)
-            logger.info(f"WandB logging enabled (mode={wandb_mode})")
-        else:
-            self.wandb = None
+            logger.info("WandB logging enabled")
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -105,27 +83,16 @@ class Trainer:
         else:
             transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
 
-        model_overrides = {
-            "enable_action_residual_adapter": config.enable_action_residual_adapter,
-            "action_adapter_dim": config.action_adapter_dim,
-            "action_adapter_dropout": config.action_adapter_dropout,
-        }
         self.transformer = load_transformer(
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
-            model_overrides=model_overrides,
         )
 
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
-        self.transformer.train()
-        self.configure_trainable_modules()
 
-        logger.info(
-            "Setting up distributed model (%s)...",
-            os.environ.get("LINGBOT_VA_DIST_STRATEGY", "fsdp"),
-        )
+        logger.info("Setting up FSDP...")
         shard_fn = shard_model
         self.transformer = _configure_model(
             model=self.transformer,
@@ -135,8 +102,7 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        if self.config.rank == 0:
-            self.log_trainable_params()
+        self.transformer.requires_grad_(True)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -152,39 +118,40 @@ class Trainer:
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
+        if hasattr(config, 'resume_from') and config.resume_from:
+            resume_step = self._infer_resume_step(config.resume_from)
+            self.step = resume_step
+            if resume_step > 0:
+                for _ in range(resume_step):
+                    self.lr_scheduler.step()
+            if self.config.rank == 0:
+                logger.info(f"Resuming step counter from step {self.step}")
+
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
-        if config.batch_size > 1:
-            batch_sampler = BucketedDistributedBatchSampler(
-                train_dataset.bucket_keys,
-                batch_size=config.batch_size,
-                num_replicas=config.world_size,
-                rank=config.rank,
-                shuffle=True,
-                seed=42,
-                pad_batches=True,
-            )
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_sampler=batch_sampler,
-                num_workers=config.load_worker,
-            )
-        else:
-            train_sampler = DistributedSampler(
-                train_dataset,
-                num_replicas=config.world_size,
-                rank=config.rank,
-                shuffle=True,
-                seed=42
-            ) if config.world_size > 1 else None
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_size=config.batch_size,
-                shuffle=(train_sampler is None), 
-                num_workers=config.load_worker,
-                sampler=train_sampler,
-            )
+        init_workers = getattr(
+            config,
+            'init_worker',
+            int(os.environ.get('LINGBOT_VA_INIT_WORKERS', '8'))
+        )
+        train_dataset = MultiLatentLeRobotDataset(
+            config=config,
+            num_init_worker=init_workers,
+        )
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=config.world_size,
+            rank=config.rank,
+            shuffle=True,
+            seed=42
+        ) if config.world_size > 1 else None
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=(train_sampler is None), 
+            num_workers=config.load_worker,
+            sampler=train_sampler,
+        )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
@@ -198,60 +165,14 @@ class Trainer:
         self.train_loader_iter = None
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
+    
 
-    def _base_transformer(self):
-        return self.transformer.module if hasattr(self.transformer, "module") else self.transformer
-
-    def configure_trainable_modules(self):
-        base_transformer = self._base_transformer()
-        base_transformer.requires_grad_(False)
-
-        if not self.config.freeze_backbone:
-            base_transformer.blocks.requires_grad_(True)
-            base_transformer.norm_out.requires_grad_(True)
-
-        if not self.config.freeze_embeddings:
-            for module_name in [
-                "patch_embedding_mlp",
-                "action_embedder",
-                "condition_embedder",
-                "condition_embedder_action",
-            ]:
-                module = getattr(base_transformer, module_name, None)
-                if module is not None:
-                    module.requires_grad_(True)
-
-        if self.config.train_action_adapter:
-            adapters = getattr(base_transformer, "action_residual_adapters", None)
-            if adapters is not None:
-                adapters.requires_grad_(True)
-
-        if self.config.train_action_head:
-            base_transformer.action_proj_out.requires_grad_(True)
-
-        if self.config.train_video_heads:
-            base_transformer.proj_out.requires_grad_(True)
-
-        if self.config.train_time_embedder:
-            for name in ["condition_embedder", "condition_embedder_action", "scale_shift_table"]:
-                module = getattr(base_transformer, name, None)
-                if module is not None:
-                    module.requires_grad_(True)
-
-    def log_trainable_params(self):
-        base_transformer = self._base_transformer()
-        total = 0
-        trainable = 0
-        trainable_names = []
-        for name, param in base_transformer.named_parameters():
-            total += param.numel()
-            if param.requires_grad:
-                trainable += param.numel()
-                trainable_names.append(name)
-
-        logger.info("Trainable params: %d / %d", trainable, total)
-        for name in trainable_names[:50]:
-            logger.info("trainable: %s", name)
+    def _infer_resume_step(self, checkpoint_path):
+        checkpoint_dir = Path(checkpoint_path)
+        match = re.search(r"checkpoint_step_(\d+)", checkpoint_dir.as_posix())
+        if match:
+            return int(match.group(1))
+        return 0
 
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -262,13 +183,8 @@ class Trainer:
             batch = next(self.train_loader_iter)
         except StopIteration:
             # Reset sampler and iterator when epoch finishes
-            epoch_owner = None
-            if hasattr(self.train_loader, "batch_sampler") and hasattr(self.train_loader.batch_sampler, "set_epoch"):
-                epoch_owner = self.train_loader.batch_sampler
-            elif hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
-                epoch_owner = self.train_loader.sampler
-            if epoch_owner is not None:
-                epoch_owner.set_epoch(getattr(epoch_owner, "epoch", 0) + 1)
+            if hasattr(self.train_loader.sampler, 'set_epoch'):
+                self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
         
@@ -359,18 +275,9 @@ class Trainer:
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
-        def move_to_device(value):
-            if isinstance(value, torch.Tensor):
-                return value.to(self.device)
-            if isinstance(value, dict):
-                return {k: move_to_device(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [move_to_device(v) for v in value]
-            if isinstance(value, tuple):
-                return tuple(move_to_device(v) for v in value)
-            return value
-
-        return move_to_device(input_dict)
+        for key, value in input_dict.items():
+            input_dict[key] = value.to(self.device)#.to(self.dtype)
+        return input_dict
 
     def compute_loss(self,
         input_dict,
@@ -415,51 +322,41 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
-        debug_first_step = self.config.rank == 0 and self.step == 0
-        step_t0 = time.perf_counter()
         batch = self.convert_input_format(batch)
-        if debug_first_step:
-            logger.info("First train step: batch moved to device in %.2fs", time.perf_counter() - step_t0)
         input_dict = self._prepare_input_dict(batch)
-        if debug_first_step:
-            logger.info("First train step: input_dict prepared in %.2fs", time.perf_counter() - step_t0)
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        sync_context = nullcontext()
-        if dist.is_initialized() and not should_sync:
-            if hasattr(self.transformer, "set_requires_gradient_sync"):
-                self.transformer.set_requires_gradient_sync(False)
-            elif hasattr(self.transformer, "no_sync"):
-                sync_context = self.transformer.no_sync()
-        elif hasattr(self.transformer, "set_requires_gradient_sync"):
-            self.transformer.set_requires_gradient_sync(True)
+        rank = getattr(self.config, 'rank', -1)
+        logger.info(
+            f"microstep_enter rank={rank} step={self.step} microstep={batch_idx} should_sync={should_sync} "
+            f"latents_shape={tuple(batch['latents'].shape)} actions_shape={tuple(batch['actions'].shape)} "
+            f"actions_mask_shape={tuple(batch['actions_mask'].shape)}"
+        )
+        
+        if hasattr(self.transformer, 'set_requires_gradient_sync'):
+            self.transformer.set_requires_gradient_sync(should_sync)
 
-        with sync_context:
-            forward_t0 = time.perf_counter()
-            output = self.transformer(input_dict, train_mode=True)
-            if debug_first_step:
-                logger.info("First train step: transformer forward finished in %.2fs", time.perf_counter() - forward_t0)
-            loss_t0 = time.perf_counter()
-            latent_loss, action_loss = self.compute_loss(input_dict, output)
-            if debug_first_step:
-                logger.info("First train step: loss computed in %.2fs", time.perf_counter() - loss_t0)
-            loss = latent_loss + action_loss
-            backward_t0 = time.perf_counter()
-            loss.backward()
-            if debug_first_step:
-                logger.info("First train step: backward finished in %.2fs", time.perf_counter() - backward_t0)
+        output = self.transformer(input_dict, train_mode=True)
+        latent_loss, action_loss = self.compute_loss(input_dict, output)
+        loss = latent_loss + action_loss
+        logger.info(
+            f"microstep_pre_backward rank={rank} step={self.step} microstep={batch_idx} should_sync={should_sync} "
+            f"latent_loss={latent_loss.detach().float().item():.4f} action_loss={action_loss.detach().float().item():.4f}"
+        )
+
+        loss.backward()
+        logger.info(
+            f"microstep_post_backward rank={rank} step={self.step} microstep={batch_idx} should_sync={should_sync}"
+        )
 
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
         
         # Only update weights after accumulating gradients
         if should_sync:
-            optim_t0 = time.perf_counter()
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
-            if debug_first_step:
-                logger.info("First train step: optimizer phase finished in %.2fs", time.perf_counter() - optim_t0)
             
             losses['total_norm'] = total_norm
             losses['should_log'] = True
@@ -471,14 +368,10 @@ class Trainer:
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
-            base_transformer = self.transformer.module if hasattr(self.transformer, "module") else self.transformer
-            if hasattr(self.transformer, "module"):
-                state_dict = base_transformer.state_dict()
-            else:
-                state_dict = get_model_state_dict(
-                    self.transformer,
-                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-                )
+            state_dict = get_model_state_dict(
+                self.transformer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
             # optim_state = get_optimizer_state_dict(
             #         self.transformer, self.optimizer,
@@ -503,7 +396,7 @@ class Trainer:
 
                 # Save config (copy from original transformer config and update _name_or_path)
                 config_file = transformer_dir / "config.json"
-                config_dict = dict(base_transformer.config)
+                config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
@@ -519,11 +412,18 @@ class Trainer:
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
+            # Synchronize all processes after saving
+            if dist.is_initialized():
+                dist.barrier()
+
         except Exception as e:
             if self.config.rank == 0:
                 logger.error(f"Failed to save checkpoint: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
+            # Ensure all processes stay synchronized even on error
+            if dist.is_initialized():
+                dist.barrier()
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
@@ -552,6 +452,10 @@ class Trainer:
         if self.config.rank == 0:
             logger.info(f"Training state loaded, resuming from step {self.step}")
 
+        # Synchronize all ranks
+        if dist.is_initialized():
+            dist.barrier()
+
     def train(self):
         """Main training loop - train by steps instead of epochs."""
         logger.info(f"Starting training for {self.config.num_steps} steps...")
@@ -570,29 +474,13 @@ class Trainer:
         accumulated_latent_losses = []
         accumulated_action_losses = []
         step_in_accumulation = 0
+        step_start_time = time.perf_counter()
 
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
-            if self.config.rank == 0 and self.step == 0 and step_in_accumulation == 0:
-                logger.info("Fetching first batch...")
-            batch_fetch_start = time.perf_counter()
             batch = self._get_next_batch()
-            batch_fetch_elapsed = time.perf_counter() - batch_fetch_start
-            if self.config.rank == 0 and self.step == 0 and step_in_accumulation == 0:
-                logger.info(f"First batch fetched in {batch_fetch_elapsed:.2f}s")
             
-            if self.config.rank == 0 and self.step == 0 and step_in_accumulation == 0:
-                logger.info("Running first train step...")
-            train_step_start = time.perf_counter()
             losses = self._train_step(batch, step_in_accumulation)
-            train_step_elapsed = time.perf_counter() - train_step_start
-            if self.config.rank == 0 and self.step == 0:
-                logger.info(
-                    "Train micro-step finished: accum_idx=%d fetch=%.2fs step=%.2fs",
-                    step_in_accumulation,
-                    batch_fetch_elapsed,
-                    train_step_elapsed,
-                )
             
             # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
@@ -601,44 +489,42 @@ class Trainer:
 
             # Log and checkpoint when optimizer steps
             if losses['should_log']:
-                global_step = self.step + 1
                 lr = self.lr_scheduler.get_last_lr()[0]
 
-                local_loss_sums = torch.stack(
-                    [
-                        torch.stack(accumulated_latent_losses).sum(),
-                        torch.stack(accumulated_action_losses).sum(),
-                    ]
-                )
-                mean_loss_sums = local_loss_sums.clone()
-                max_loss_sums = local_loss_sums.clone()
-                if dist.is_initialized():
-                    dist.all_reduce(mean_loss_sums, op=dist.ReduceOp.AVG)
-                    dist.all_reduce(max_loss_sums, op=dist.ReduceOp.MAX)
-                latent_loss_show = mean_loss_sums[0].detach().cpu().item()
-                action_loss_show = mean_loss_sums[1].detach().cpu().item()
-                max_latent_loss_show = max_loss_sums[0].detach().cpu().item()
-                max_action_loss_show = max_loss_sums[1].detach().cpu().item()
+                # Average accumulated losses
+                latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
+                action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
+                max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
                 step_in_accumulation = 0
 
-                if self.config.gc_interval > 0 and global_step % self.config.gc_interval == 0:
+                torch.cuda.synchronize()
+                if self.step % self.config.gc_interval == 0:
                     torch.cuda.empty_cache()
                     gc.collect()
 
+                step_time_s = time.perf_counter() - step_start_time
+
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
-                    progress_bar.update(1)
+                    progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
-                        'step': global_step,
+                        'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
-                        'lr': f'{lr:.2e}'
+                        'lr': f'{lr:.2e}',
+                        'step_time_s': f'{step_time_s:.2f}'
                     })
+                    logger.info(
+                        f"train_step step={self.step} latent_loss={latent_loss_show:.4f} "
+                        f"action_loss={action_loss_show:.4f} grad_norm={total_norm.item():.2f} "
+                        f"lr={lr:.2e} step_time_s={step_time_s:.2f}"
+                    )
                     if self.config.enable_wandb:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
@@ -647,14 +533,18 @@ class Trainer:
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'grad_norm': total_norm.item(),
                             'lr': lr,
-                        }, step=global_step)
+                        }, step=self.step)
                 
-                self.step = global_step
+                self.step += 1
+                step_start_time = time.perf_counter()
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
+
+            if dist.is_initialized():
+                dist.barrier()
 
         progress_bar.close()
         logger.info("Training completed!")
@@ -680,12 +570,9 @@ def run(args):
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
-        logger.info(f"Dist strategy: {os.environ.get('LINGBOT_VA_DIST_STRATEGY', 'fsdp')}")
 
     trainer = Trainer(config)
     trainer.train()
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def main():

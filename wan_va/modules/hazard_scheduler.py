@@ -612,11 +612,14 @@ class HazardJumpScheduler:
         self.H_cumulative = self.H_cumulative_tensor.mean().item()
         F_k = 1.0 - torch.exp(-self.H_cumulative_tensor.mean())
 
-        forced_stop = bool(float(sigma_cur) < self.sigma_min or self.step_count >= self.K_max - 1)
-        forced_continue = bool(self.step_count < self.K_min and not forced_stop)
+        forced_stop = bool(float(sigma_cur) < self.sigma_min)
+        forced_terminal = bool(self.step_count >= self.K_max - 1 and not forced_stop)
+        forced_continue = bool(self.step_count < self.K_min and not forced_stop and not forced_terminal)
 
         if forced_stop:
             should_stop = True
+        elif forced_terminal:
+            should_stop = False
         elif forced_continue:
             should_stop = False
         elif self.mode == "train":
@@ -639,33 +642,36 @@ class HazardJumpScheduler:
                 jump_logprob_scale=self.jump_logprob_scale,
             )
         else:
-            deterministic_jump = self.mode != "train"
-            jump_ratio = self.scheduler_head.sample_jump_ratio(
-                outputs.alpha_k,
-                outputs.beta_k,
-                deterministic=deterministic_jump,
-            )
-            jump_distance = 1.0 - jump_ratio
-            sigma_next = float((jump_ratio.squeeze() * float(sigma_cur)).item())
-            sigma_next = max(0.0, min(float(sigma_next), float(sigma_cur) * (1.0 - self.scheduler_head.min_mode_eps)))
-            jump_ratio = jump_ratio.squeeze(-1)
-            jump_distance = jump_distance.squeeze(-1)
-            self.jump_ratio_history.append(jump_ratio.detach())
-            log_prob = self.scheduler_head.compute_action_logprob(
-                h_k=h_k,
-                stop_action=False,
-                jump_ratio=jump_ratio.unsqueeze(-1),
-                alpha_k=outputs.alpha_k,
-                beta_k=outputs.beta_k,
-                forced_stop=forced_stop,
-                forced_continue=forced_continue,
-                jump_logprob_scale=self.jump_logprob_scale,
-            )
+            if forced_terminal:
+                sigma_next = 0.0
+            else:
+                deterministic_jump = self.mode != "train"
+                jump_ratio = self.scheduler_head.sample_jump_ratio(
+                    outputs.alpha_k,
+                    outputs.beta_k,
+                    deterministic=deterministic_jump,
+                )
+                jump_distance = 1.0 - jump_ratio
+                sigma_next = float((jump_ratio.squeeze() * float(sigma_cur)).item())
+                sigma_next = max(0.0, min(float(sigma_next), float(sigma_cur) * (1.0 - self.scheduler_head.min_mode_eps)))
+                jump_ratio = jump_ratio.squeeze(-1)
+                jump_distance = jump_distance.squeeze(-1)
+                self.jump_ratio_history.append(jump_ratio.detach())
+                log_prob = self.scheduler_head.compute_action_logprob(
+                    h_k=h_k,
+                    stop_action=False,
+                    jump_ratio=jump_ratio.unsqueeze(-1),
+                    alpha_k=outputs.alpha_k,
+                    beta_k=outputs.beta_k,
+                    forced_stop=forced_stop,
+                    forced_continue=forced_continue,
+                    jump_logprob_scale=self.jump_logprob_scale,
+                )
 
         self.delta_H_history.append(delta_H_k)
         self.h_k_history.append(h_k)
         self.step_count += 1
-        if should_stop:
+        if should_stop or forced_terminal:
             self.stopped = True
             self.stop_step = self.step_count
 
@@ -676,6 +682,7 @@ class HazardJumpScheduler:
             "should_stop": bool(should_stop),
             "forced_stop": forced_stop,
             "forced_continue": forced_continue,
+            "forced_terminal": forced_terminal,
             "log_prob": log_prob,
             "step_count": self.step_count,
             "H_cumulative": self.H_cumulative,

@@ -121,11 +121,13 @@ def test_v2_rollout_records_sigma_and_jump_histories():
     )
 
     assert result.executed_video_steps >= 1
-    assert len(result.trajectory) == result.executed_video_steps
-    assert len(result.sigma_cur_history) == result.executed_video_steps
-    assert len(result.sigma_next_history) == result.executed_video_steps
-    assert len(result.jump_ratio_history) == result.executed_video_steps
-    assert len(result.jump_distance_history) == result.executed_video_steps
+    assert len(result.trajectory) >= result.executed_video_steps
+    assert len(result.sigma_cur_history) == len(result.trajectory)
+    assert len(result.sigma_next_history) == len(result.trajectory)
+    assert len(result.jump_ratio_history) == len(result.trajectory)
+    assert len(result.jump_distance_history) == len(result.trajectory)
+    actual_updates = sum(1 for sigma_next in result.sigma_next_history if sigma_next is not None)
+    assert result.executed_video_steps == actual_updates
     assert result.equivalent_fixed_steps >= 1.0
     assert result.equivalent_fixed_steps <= runner.num_video_steps
     assert result.terminal_sigma is not None
@@ -141,11 +143,27 @@ def test_v2_rollout_sigma_min_forces_stop_without_jump():
         mode="eval",
     )
 
-    assert result.executed_video_steps == 1
+    assert result.executed_video_steps == 0
     assert result.trajectory[0]["forced_stop"] is True
     assert result.trajectory[0]["sigma_next"] is None
     assert result.jump_ratio_history == [None]
     assert result.jump_distance_history == [None]
+
+
+def test_v2_rollout_reaches_terminal_sigma_zero_at_k_max():
+    runner, _transformer = make_runner(sigma_min=0.0)
+    result = runner.rollout_single_sample(
+        video_noise=torch.randn(1, 1, 2, 1, 1),
+        action_noise=torch.randn(1, 2, 2, 3, 1),
+        text_emb=torch.zeros(1, 4, 4),
+        mode="eval",
+    )
+
+    assert result.executed_video_steps == runner.K_max
+    assert result.terminal_sigma == 0.0
+    assert result.equivalent_fixed_steps == runner.num_video_steps
+    assert result.trajectory[-1]["forced_terminal"] is True
+    assert result.sigma_next_history[-1] == 0.0
 
 
 def test_v2_rollout_keeps_first_chunk_conditioning():

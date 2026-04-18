@@ -9,7 +9,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from wan_va.wan_va_server import VA_Server
+from wan_va.wan_va_server import HazardJumpSchedulerHead, VA_Server
 
 
 class DummyScheduler:
@@ -19,6 +19,20 @@ class DummyScheduler:
     def step(self, pred, t, latents, return_dict=False):
         self.calls.append(float(t))
         return latents + 1
+
+
+class DummyJumpVideoScheduler:
+    def __init__(self):
+        self.sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+
+    def sigma_to_timestep(self, sigma):
+        return torch.tensor(float(sigma), dtype=torch.float32)
+
+    def custom_step(self, model_output, sigma_cur, sigma_next, sample, return_dict=False):
+        return sample + 1
+
+    def approx_step_index(self, sigma):
+        return 24 if float(sigma) <= 0.0 else 12
 
 
 def make_server_stub():
@@ -40,6 +54,12 @@ def make_server_stub():
         action_per_frame=2,
         hazard_return_metadata=True,
         save_debug_artifacts=True,
+        hazard_feature_source="cond",
+        hazard_K_max=25,
+        hazard_K_min=3,
+        hazard_eta=0.8,
+        hazard_sigma_min=0.01,
+        jump_logprob_scale=1.0,
     )
     server.scheduler = DummyScheduler()
     server._sync_device = lambda: None
@@ -170,3 +190,85 @@ def test_invalid_online_scheduler_mode_raises():
 
     with pytest.raises(ValueError, match="Unsupported online_scheduler_mode"):
         server._get_online_scheduler_mode()
+
+
+def test_hazard_jump_video_loop_reports_actual_update_count(monkeypatch):
+    server = make_server_stub()
+    server.scheduler = DummyJumpVideoScheduler()
+    server.job_config.num_inference_steps = 25
+    server.job_config.hazard_K_max = 2
+    server.job_config.hazard_K_min = 1
+    server.hazard_scheduler_head = HazardJumpSchedulerHead(feature_dim=4, hidden_dim=8)
+    server.hazard_policy_variant = "stop_jump_v2"
+    server.hazard_checkpoint_step = 10000
+
+    class FakeHazardJumpScheduler:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+            self.H_cumulative = 1.5
+
+        def step(self, _video_feature, sigma_cur):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "delta_H_k": torch.tensor([[0.1]], dtype=torch.float32),
+                    "h_k": torch.tensor([[0.2]], dtype=torch.float32),
+                    "F_k": 0.2,
+                    "should_stop": False,
+                    "forced_stop": False,
+                    "forced_continue": False,
+                    "forced_terminal": False,
+                    "log_prob": None,
+                    "step_count": 1,
+                    "H_cumulative": 0.1,
+                    "sigma_cur": float(sigma_cur),
+                    "sigma_next": 0.5,
+                    "jump_ratio": torch.tensor([0.5], dtype=torch.float32),
+                    "jump_distance": torch.tensor([0.5], dtype=torch.float32),
+                    "alpha_k": torch.tensor([[2.0]], dtype=torch.float32),
+                    "beta_k": torch.tensor([[2.0]], dtype=torch.float32),
+                    "jump_mode_k": torch.tensor([[0.5]], dtype=torch.float32),
+                    "jump_concentration_k": torch.tensor([[4.0]], dtype=torch.float32),
+                }
+            return {
+                "delta_H_k": torch.tensor([[0.1]], dtype=torch.float32),
+                "h_k": torch.tensor([[0.2]], dtype=torch.float32),
+                "F_k": 0.4,
+                "should_stop": False,
+                "forced_stop": False,
+                "forced_continue": False,
+                "forced_terminal": True,
+                "log_prob": None,
+                "step_count": 2,
+                "H_cumulative": 0.2,
+                "sigma_cur": float(sigma_cur),
+                "sigma_next": 0.0,
+                "jump_ratio": None,
+                "jump_distance": None,
+                "alpha_k": torch.tensor([[2.0]], dtype=torch.float32),
+                "beta_k": torch.tensor([[2.0]], dtype=torch.float32),
+                "jump_mode_k": torch.tensor([[0.5]], dtype=torch.float32),
+                "jump_concentration_k": torch.tensor([[4.0]], dtype=torch.float32),
+            }
+
+    monkeypatch.setattr("wan_va.wan_va_server.HazardJumpScheduler", FakeHazardJumpScheduler)
+
+    latents = torch.zeros(1, 1, 2, 1, 1)
+    video_timesteps = torch.tensor([25.0, 20.0], dtype=torch.float32)
+    padded_video_timesteps = torch.tensor([25.0, 20.0, 0.0], dtype=torch.float32)
+
+    out_latents, meta = server._run_hazard_jump_video_loop(
+        latents,
+        video_timesteps,
+        padded_video_timesteps,
+        frame_chunk_size=2,
+        frame_st_id=0,
+    )
+
+    assert meta["mode"] == "hazard_jump_v2"
+    assert meta["video_steps_used"] == 2
+    assert meta["video_decision_steps_used"] == 2
+    assert meta["terminal_sigma"] == 0.0
+    assert meta["equivalent_fixed_steps"] == 25
+    assert server._test_refresh_calls[0][0] == 0.0
+    assert torch.allclose(out_latents, latents + 2)
