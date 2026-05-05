@@ -17,6 +17,7 @@ from lerobot.constants import HF_LEROBOT_HOME
 from .action_transforms import (
     get_relative_pose,
     get_relative_xyz_action,
+    map_binary_gripper_01_to_pm1,
     to_numpy_array,
 )
 
@@ -267,20 +268,27 @@ class LatentLeRobotDataset(LeRobotDataset):
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        elif (
-            self.config.env_type == "none"
-            and getattr(self.config, "action_representation", "absolute")
-            == "relative_chunk_anchor"
-        ):
-            relative_action_base = getattr(
-                self.config, "relative_action_base", "chunk_anchor"
-            )
-            if relative_action_base != "chunk_anchor":
-                raise ValueError(
-                    "UR10 relative action processing only supports "
-                    f"relative_action_base='chunk_anchor', got {relative_action_base!r}"
+        elif self.config.env_type == "none":
+            action = map_binary_gripper_01_to_pm1(action)
+            if getattr(self.config, "action_representation", "absolute") == "relative_chunk_anchor":
+                relative_action_base = getattr(
+                    self.config, "relative_action_base", "chunk_anchor"
                 )
-            action = get_relative_xyz_action(action)
+                if relative_action_base != "chunk_anchor":
+                    raise ValueError(
+                        "UR10 relative action processing only supports "
+                        f"relative_action_base='chunk_anchor', got {relative_action_base!r}"
+                    )
+                action = get_relative_xyz_action(action)
+            action_source_indices = getattr(self.config, "action_source_indices", None)
+            if action_source_indices is not None:
+                action_source_indices = list(action_source_indices)
+                if len(action_source_indices) != len(self.config.used_action_channel_ids):
+                    raise ValueError(
+                        "action_source_indices must match used_action_channel_ids length: "
+                        f"{len(action_source_indices)} vs {len(self.config.used_action_channel_ids)}"
+                    )
+                action = action[:, action_source_indices]
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1

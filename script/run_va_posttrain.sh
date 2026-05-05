@@ -30,8 +30,10 @@ config_name=${CONFIG_NAME}
 
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF}}"
 python_bin=${PYTHON_BIN:-python}
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
+TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
 ${python_bin} -m torch.distributed.run \
     --nproc_per_node=${num_gpu} \
     --local-ranks-filter=${log_rank} \

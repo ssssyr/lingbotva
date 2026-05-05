@@ -17,6 +17,7 @@ train_config_name=${TRAIN_CONFIG_NAME:-0}
 model_name=${MODEL_NAME:-0}
 start_port=${START_PORT:-29556}
 num_gpus=${NUM_GPUS:-8}
+gpu_offset=${GPU_OFFSET:-0}
 video_guidance_scale=${VIDEO_GUIDANCE_SCALE:-5}
 action_guidance_scale=${ACTION_GUIDANCE_SCALE:-1}
 dry_run=${DRY_RUN:-0}
@@ -110,6 +111,7 @@ echo "seed=${seed}"
 echo "test_num=${test_num}"
 echo "start_port=${start_port}"
 echo "num_gpus=${num_gpus}"
+echo "gpu_offset=${gpu_offset}"
 
 if [[ ${#missing_tasks[@]} -eq 0 ]]; then
     echo "No missing or incomplete tasks found."
@@ -137,7 +139,7 @@ for ((batch_start=0; batch_start<${#missing_tasks[@]}; batch_start+=num_gpus)); 
     batch_pids=()
     for i in "${!batch_tasks[@]}"; do
         task_name="${batch_tasks[$i]}"
-        gpu_id=$((i % num_gpus))
+        gpu_id=$((gpu_offset + (i % num_gpus)))
         port=$((start_port + i))
         log_file="${log_dir}/${task_name}_${batch_time}.log"
 
@@ -167,7 +169,15 @@ for ((batch_start=0; batch_start<${#missing_tasks[@]}; batch_start+=num_gpus)); 
     done
 
     echo "Waiting for batch $((batch_start / num_gpus + 1)) to finish..."
-    wait "${batch_pids[@]}"
+    batch_failed=0
+    for pid in "${batch_pids[@]}"; do
+        if ! wait "${pid}"; then
+            batch_failed=1
+        fi
+    done
+    if [[ ${batch_failed} -ne 0 ]]; then
+        echo "Batch $((batch_start / num_gpus + 1)) finished with failures; continuing to next missing task batch."
+    fi
 done
 
 echo "All missing tasks finished. PIDs recorded in ${pid_file}."

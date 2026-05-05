@@ -41,3 +41,18 @@ def get_relative_xyz_action(action, xyz_slice: slice = slice(0, 3)) -> np.ndarra
 
     action_np[:, xyz_slice] -= action_np[0:1, xyz_slice]
     return action_np
+
+
+def map_binary_gripper_01_to_pm1(action, gripper_idx: int = 6) -> np.ndarray:
+    action_np = to_numpy_array(action).copy()
+    if action_np.ndim != 2:
+        raise ValueError(
+            f"Expected action with shape [T, D], got {tuple(action_np.shape)}"
+        )
+    if action_np.shape[0] == 0:
+        return action_np
+
+    gripper = action_np[:, gripper_idx]
+    gripper = np.where(gripper >= 0.5, 1.0, -1.0).astype(np.float32, copy=False)
+    action_np[:, gripper_idx] = gripper
+    return action_np

@@ -1,13 +1,21 @@
 import numpy as np
-from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
 import argparse
-from libero.libero import benchmark
+import hashlib
+import json
+import re
 import time
-from libero.libero.envs import OffScreenRenderEnv
-from pathlib import Path
-from tqdm import tqdm
-from lerobot.datasets.utils import write_json
 import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
+from libero.libero import benchmark
+from libero.libero.envs import OffScreenRenderEnv
+from tqdm import tqdm
 import imageio
 import cv2
 
@@ -30,6 +38,67 @@ def save_video(real_obs_list, save_path, fps=15, video_names=["observation.image
 
     imageio.mimsave(save_path, final_frames, fps=fps)
     print(f"✅ Video saved to: {save_path}")
+
+
+def write_json_file(payload, path):
+    path = Path(path)
+    path.parent.mkdir(exist_ok=True, parents=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _sanitize_prompt_for_path(prompt, max_prefix=80):
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", prompt).strip("._-")
+    cleaned = re.sub(r"_+", "_", cleaned)
+    if not cleaned:
+        cleaned = "task"
+    prefix = cleaned[:max_prefix].rstrip("._-")
+    return prefix or "task"
+
+
+def _task_dir_name(task_idx, prompt):
+    prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
+    prompt_prefix = _sanitize_prompt_for_path(prompt)
+    return f"{task_idx}_{prompt_prefix}_{prompt_hash}"
+
+
+def _legacy_task_dir_name(task_idx, prompt):
+    return f"{task_idx}_{prompt.replace(' ', '_')}"
+
+
+def _candidate_task_dirs(out_dir, libero_benchmark, task_idx, prompt):
+    root = Path(out_dir) / libero_benchmark
+    names = [_task_dir_name(task_idx, prompt)]
+    legacy = _legacy_task_dir_name(task_idx, prompt)
+    if legacy not in names:
+        names.append(legacy)
+    return [root / name for name in names]
+
+
+def get_existing_episode_results(out_dir, libero_benchmark, task_idx, prompt, test_num):
+    results = {}
+    for task_dir in _candidate_task_dirs(out_dir, libero_benchmark, task_idx, prompt):
+        try:
+            exists = task_dir.exists()
+        except OSError:
+            continue
+        if not exists:
+            continue
+        try:
+            video_paths = list(task_dir.glob("*.mp4"))
+        except OSError:
+            continue
+        for video_path in video_paths:
+            parts = video_path.stem.split("_", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                episode_idx = int(parts[0])
+            except ValueError:
+                continue
+            if episode_idx >= test_num:
+                continue
+            results[episode_idx] = parts[1] == "True"
+    return results
 
 
 def construct_single_env(env_args):
@@ -123,7 +192,7 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
         else:
             model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
 
-    out_file = Path(out_dir) / libero_benchmark / f"{task_idx}_{prompt.replace(' ', '_')}" / f"{episode_idx}_{done}.mp4"
+    out_file = Path(out_dir) / libero_benchmark / _task_dir_name(task_idx, prompt) / f"{episode_idx}_{done}.mp4"
     out_file.parent.mkdir(exist_ok=True, parents=True)
 
     save_video(
@@ -154,31 +223,36 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
     print(f"#################### Use benchmark: {libero_benchmark}, num_tasks: {num_tasks} #############")
     model = WebsocketClientPolicy(port=port)
 
-    video_save_root_dict = None
-
-    episode_list = range(test_num)
     for task_idx in progress_bar:
-        if video_save_root_dict is not None and task_idx in video_save_root_dict:
-            video_save_list = os.listdir(os.path.join(out_dir, libero_benchmark, video_save_root_dict[task_idx]))
-            video_states = [1 for file in video_save_list if file.split('_')[1].split('.')[0] == 'True']
-            succ_num = float(len(video_states))
-            episode_list = range(len(video_save_list), test_num)
-        else:
-            succ_num = 0.
+        benchmark_dict = benchmark.get_benchmark_dict()
+        benchmark_instance = benchmark_dict[libero_benchmark]()
+        prompt = benchmark_instance.get_task(task_idx).language
+        existing_results = get_existing_episode_results(out_dir, libero_benchmark, task_idx, prompt, test_num)
+        succ_num = float(sum(existing_results.values()))
+        completed_num = len(existing_results)
+        episode_list = [idx for idx in range(test_num) if idx not in existing_results]
+
+        if not episode_list:
+            out_file = Path(out_dir) / f"{libero_benchmark}_{task_idx}.json"
+            write_json_file({
+                "succ_num": succ_num,
+                "total_num": float(completed_num),
+                "succ_rate": succ_num / completed_num if completed_num else 0.0,
+            }, out_file)
+            continue
 
         for episode_idx in tqdm(episode_list, total=len(episode_list)):
             res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx)
             succ_num += res_i
-            succ_rate = succ_num / (episode_idx + 1)
-            print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {episode_idx + 1}")
+            completed_num += 1
+            succ_rate = succ_num / completed_num
+            print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {completed_num}")
             out_file = Path(out_dir) / f"{libero_benchmark}_{task_idx}.json"
-            out_file.parent.mkdir(exist_ok=True, parents=True)
-            write_json({
+            write_json_file({
                 "succ_num": succ_num,
-                "total_num": episode_idx + 1.,
+                "total_num": float(completed_num),
                 "succ_rate": succ_rate,
-                }, out_file
-            )
+                }, out_file)
 
 
 def main():

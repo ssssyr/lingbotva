@@ -35,6 +35,7 @@ from datetime import datetime
 import importlib
 import argparse
 import pdb
+import gc
 from evaluation.robotwin.geometry import euler2quat
 import numpy as np
 
@@ -47,6 +48,7 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 import json
 from pathlib import Path
+import torch
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
@@ -552,12 +554,20 @@ def eval_policy(task_name,
                 expert_episode_passed = bool(TASK_ENV.plan_success and TASK_ENV.check_success())
                 TASK_ENV.close_env()
             except UnStableError as e:
-                TASK_ENV.close_env()
+                TASK_ENV.close_env(clear_cache=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                TASK_ENV = class_decorator(args["task_name"])
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                TASK_ENV.close_env()
+                TASK_ENV.close_env(clear_cache=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                TASK_ENV = class_decorator(args["task_name"])
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")

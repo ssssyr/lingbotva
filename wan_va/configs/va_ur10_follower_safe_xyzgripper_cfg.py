@@ -55,6 +55,9 @@ va_ur10_follower_safe_xyzgripper_cfg.action_snr_shift = 1.0
 
 # Only learn x/y/z and gripper. Orientation is fixed by the runtime bridge.
 va_ur10_follower_safe_xyzgripper_cfg.used_action_channel_ids = [0, 1, 2, 28]
+# Raw UR10 LeRobot actions are [x, y, z, rx, ry, rz, gripper].
+# Compact them to the four learned channels before canonical 30-D alignment.
+va_ur10_follower_safe_xyzgripper_cfg.action_source_indices = [0, 1, 2, 6]
 inverse_used_action_channel_ids = [
     len(va_ur10_follower_safe_xyzgripper_cfg.used_action_channel_ids)
 ] * va_ur10_follower_safe_xyzgripper_cfg.action_dim
@@ -72,12 +75,12 @@ va_ur10_follower_safe_xyzgripper_cfg.norm_stat = {
         0.34905938286342525,
     ]
     + [0.0] * 25
-    + [-1.000000013351432e-10, 0.0],
+    + [-1.0, 0.0],
     "q99": [
         0.8777034230434345,
         0.08205861096422079,
         0.6177889849397484,
     ]
     + [0.0] * 25
-    + [0.9999970714593885, 0.0],
+    + [1.0, 0.0],
 }

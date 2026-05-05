@@ -86,24 +86,6 @@ assignments = {
     "LOG_RANK": env_override("LOG_RANK", launcher.get("log_rank", 0)),
     "TORCHFT_LIGHTHOUSE": env_override("TORCHFT_LIGHTHOUSE", launcher.get("torchft_lighthouse", "http://localhost:29510")),
     "LINGBOT_VA_FORCE_ATTN_MODE": optional_env_override("LINGBOT_VA_FORCE_ATTN_MODE", launcher.get("force_attn_mode")),
-    "NCCL_P2P_DISABLE": optional_env_override("NCCL_P2P_DISABLE", launcher.get("nccl_p2p_disable")),
-    "NCCL_IB_DISABLE": optional_env_override("NCCL_IB_DISABLE", launcher.get("nccl_ib_disable")),
-    "NCCL_SHM_DISABLE": optional_env_override("NCCL_SHM_DISABLE", launcher.get("nccl_shm_disable")),
-    "NCCL_CUMEM_ENABLE": optional_env_override("NCCL_CUMEM_ENABLE", launcher.get("nccl_cumem_enable")),
-    "NCCL_SOCKET_IFNAME": optional_env_override("NCCL_SOCKET_IFNAME", launcher.get("nccl_socket_ifname")),
-    "NCCL_NVLS_ENABLE": optional_env_override("NCCL_NVLS_ENABLE", launcher.get("nccl_nvls_enable")),
-    "NCCL_COLLNET_ENABLE": optional_env_override("NCCL_COLLNET_ENABLE", launcher.get("nccl_collnet_enable")),
-    "NCCL_ALGO": optional_env_override("NCCL_ALGO", launcher.get("nccl_algo")),
-    "NCCL_PROTO": optional_env_override("NCCL_PROTO", launcher.get("nccl_proto")),
-    "NCCL_DEBUG": optional_env_override("NCCL_DEBUG", launcher.get("nccl_debug")),
-    "NCCL_DEBUG_SUBSYS": optional_env_override("NCCL_DEBUG_SUBSYS", launcher.get("nccl_debug_subsys")),
-    "TORCH_NCCL_DUMP_ON_TIMEOUT": optional_env_override("TORCH_NCCL_DUMP_ON_TIMEOUT", launcher.get("torch_nccl_dump_on_timeout")),
-    "TORCH_NCCL_TRACE_BUFFER_SIZE": optional_env_override("TORCH_NCCL_TRACE_BUFFER_SIZE", launcher.get("torch_nccl_trace_buffer_size")),
-    "TORCH_FR_BUFFER_SIZE": optional_env_override("TORCH_FR_BUFFER_SIZE", launcher.get("torch_fr_buffer_size")),
-    "TORCH_NCCL_DESYNC_DEBUG": optional_env_override("TORCH_NCCL_DESYNC_DEBUG", launcher.get("torch_nccl_desync_debug")),
-    "TORCH_NCCL_NAN_CHECK": optional_env_override("TORCH_NCCL_NAN_CHECK", launcher.get("torch_nccl_nan_check")),
-    "PYTORCH_ALLOC_CONF": optional_env_override("PYTORCH_ALLOC_CONF", launcher.get("pytorch_alloc_conf")),
-    "PYTORCH_CUDA_ALLOC_CONF": optional_env_override("PYTORCH_CUDA_ALLOC_CONF", launcher.get("pytorch_cuda_alloc_conf")),
     "LINGBOT_VA_TRAIN_MODEL_PATH": env_override("LINGBOT_VA_TRAIN_MODEL_PATH", paths.get("train_model_path", "")),
     "LINGBOT_VA_DATASET_PATH": env_override("LINGBOT_VA_DATASET_PATH", paths.get("dataset_path", "")),
     "LINGBOT_VA_SAVE_ROOT": env_override("LINGBOT_VA_SAVE_ROOT", paths.get("save_root", "./train_out")),
@@ -124,7 +106,6 @@ assignments = {
     "LINGBOT_VA_BATCH_SIZE": env_override("LINGBOT_VA_BATCH_SIZE", training.get("batch_size", 1)),
     "LINGBOT_VA_GRAD_ACCUM_STEPS": env_override("LINGBOT_VA_GRAD_ACCUM_STEPS", training.get("gradient_accumulation_steps", 1)),
     "LINGBOT_VA_NUM_STEPS": env_override("LINGBOT_VA_NUM_STEPS", training.get("num_steps", 50000)),
-    "LINGBOT_VA_MAX_BUCKET_KEY": optional_env_override("LINGBOT_VA_MAX_BUCKET_KEY", training.get("max_bucket_key")),
     "LINGBOT_VA_ENABLE_ACTION_ADAPTER": env_override(
         "LINGBOT_VA_ENABLE_ACTION_ADAPTER",
         int(bool(model.get("enable_action_residual_adapter", False))),
@@ -189,6 +170,7 @@ esac
 
 cd "${repo_root}"
 
+export LINGBOT_VA_MAX_BUCKET_KEY=256
 echo "[profile] ${profile_path}"
 echo "[config] ${CONFIG_NAME:-robotwin_train}"
 echo "[ngpu] ${NGPU:-8}"

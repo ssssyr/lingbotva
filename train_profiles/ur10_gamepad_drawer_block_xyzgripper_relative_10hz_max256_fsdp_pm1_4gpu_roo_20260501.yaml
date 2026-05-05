@@ -1,0 +1,64 @@
+launcher:
+  config_name: ur10_follower_safe_xyzgripper_relative_max512_train
+  ngpu: 4
+  master_port: 29681
+  log_rank: 0
+  torchft_lighthouse: http://localhost:29510
+  force_attn_mode: flex
+  nccl_p2p_disable: 1
+  nccl_ib_disable: 1
+  nccl_shm_disable: 1
+  nccl_cumem_enable: 0
+  nccl_socket_ifname: lo
+  nccl_nvls_enable: 0
+  nccl_collnet_enable: 0
+  nccl_algo: Ring
+  nccl_proto: Simple
+  nccl_debug: WARN
+  nccl_debug_subsys: INIT
+  torch_nccl_dump_on_timeout: 1
+  torch_nccl_trace_buffer_size: 200000
+  torch_fr_buffer_size: 200000
+  torch_nccl_desync_debug: 1
+  torch_nccl_nan_check: 1
+  pytorch_alloc_conf: expandable_segments:True
+
+paths:
+  train_model_path: /home/syr/code/lingbotva/artifacts/models/lingbot-va-base
+  dataset_path: /home/syr/datasets/ur10_gamepad_tcp_10hz_drawer_block_trainready_20260412
+  save_root: /home/syr/code/lingbotva/artifacts/ur10_gamepad_drawer_block_xyzgripper_relative_10hz_max256_fsdp_pm1_4gpu_20260501
+  reference_model_path: /home/syr/code/lingbotva/artifacts/models/lingbot-va-base
+
+logging:
+  enable_wandb: false
+  wandb_project: va_ur10_gamepad_drawer_block_xyzgripper_relative
+  wandb_team_name: ""
+  wandb_base_url: ""
+  wandb_api_key: ""
+
+model:
+  enable_action_residual_adapter: false
+  action_adapter_dim: 256
+  action_adapter_dropout: 0.0
+
+trainable:
+  freeze_backbone: false
+  freeze_embeddings: false
+  train_action_adapter: false
+  train_action_head: false
+  train_video_heads: false
+  train_time_embedder: false
+
+training:
+  load_workers: 8
+  init_workers: 1
+  save_interval: 50
+  gc_interval: 50
+  cfg_prob: 0.1
+  learning_rate: 1e-5
+  weight_decay: 0.1
+  warmup_steps: 10
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_bucket_key: 256
+  num_steps: 10000

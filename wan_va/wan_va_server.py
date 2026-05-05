@@ -1,6 +1,8 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import hashlib
 import os
+import re
 import sys
 import time
 from functools import partial
@@ -189,6 +191,19 @@ class VA_Server:
             "hazard_feature_source": str(getattr(self.job_config, "hazard_feature_source", "cond")),
             "save_debug_artifacts": bool(getattr(self.job_config, "save_debug_artifacts", True)),
         }
+
+    def _build_safe_exp_name(self, prompt):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        if not prompt:
+            return f"default_{timestamp}"
+
+        cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", prompt).strip("._-")
+        cleaned = re.sub(r"_+", "_", cleaned)
+        if not cleaned:
+            cleaned = "prompt"
+        prefix = cleaned[:64].rstrip("._-") or "prompt"
+        prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
+        return f"{prefix}_{prompt_hash}_{timestamp}"
 
     def _get_t5_prompt_embeds(
         self,
@@ -522,7 +537,7 @@ class VA_Server:
                 dtype=self.dtype,
             )
 
-        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+        self.exp_name = self._build_safe_exp_name(prompt)
         if self._save_debug_artifacts_enabled():
             self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
             os.makedirs(self.exp_save_root, exist_ok=True)

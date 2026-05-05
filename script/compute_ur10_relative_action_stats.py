@@ -83,6 +83,7 @@ def build_segment_actions(
     dataset_root: Path,
     episodes: list[dict],
     xyz_indices: tuple[int, int, int],
+    gripper_idx: int,
     representation: str,
 ) -> np.ndarray:
     data_root = dataset_root / "data"
@@ -101,6 +102,7 @@ def build_segment_actions(
             segment = episode_actions[start:end].copy()
             if len(segment) == 0:
                 continue
+            segment[:, gripper_idx] = np.where(segment[:, gripper_idx] >= 0.5, 1.0, -1.0).astype(np.float32, copy=False)
             if representation == "relative_chunk_anchor":
                 segment[:, xyz_indices] -= segment[:1, xyz_indices]
             segments.append(segment)
@@ -164,6 +166,7 @@ def main() -> int:
         dataset_root=dataset_root,
         episodes=episodes,
         xyz_indices=(x_idx, y_idx, z_idx),
+        gripper_idx=gripper_idx,
         representation=args.representation,
     )
     stats = compute_stats(action)

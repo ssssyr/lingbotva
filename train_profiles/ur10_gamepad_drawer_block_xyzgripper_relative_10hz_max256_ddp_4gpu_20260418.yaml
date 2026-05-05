@@ -1,0 +1,46 @@
+launcher:
+  config_name: ur10_follower_safe_xyzgripper_relative_max512_train
+  ngpu: 4
+  master_port: 29581
+  log_rank: 0
+  torchft_lighthouse: http://localhost:29510
+  force_attn_mode: torch
+
+paths:
+  train_model_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/models/lingbot-va-posttrain-robotwin
+  dataset_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/datasets/ur10_gamepad_tcp_10hz_drawer_block_trainready_20260412
+  save_root: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/code/lingbot-va/train_out/ur10_gamepad_drawer_block_xyzgripper_relative_10hz_max256_ddp_4gpu_20260418
+  reference_model_path: /cpfs01/projects-HDD/cfff-4a2485d4a88d_HDD/ct_24210860031/812/SYR/models/lingbot-va-posttrain-robotwin
+
+logging:
+  enable_wandb: false
+  wandb_project: va_ur10_gamepad_drawer_block_xyzgripper_relative
+  wandb_team_name: ""
+  wandb_base_url: ""
+  wandb_api_key: ""
+
+model:
+  enable_action_residual_adapter: false
+  action_adapter_dim: 256
+  action_adapter_dropout: 0.0
+
+trainable:
+  freeze_backbone: false
+  freeze_embeddings: false
+  train_action_adapter: false
+  train_action_head: false
+  train_video_heads: false
+  train_time_embedder: false
+
+training:
+  load_workers: 8
+  init_workers: 1
+  save_interval: 500
+  gc_interval: 50
+  cfg_prob: 0.1
+  learning_rate: 1e-5
+  weight_decay: 0.1
+  warmup_steps: 10
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  num_steps: 10000

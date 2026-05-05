@@ -14,6 +14,7 @@ from typing import Any
 
 import imageio.v2 as imageio
 import torch
+import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
 from tqdm import tqdm
@@ -84,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional downsample fps. Must evenly divide the dataset fps.",
+    )
+    parser.add_argument(
+        "--target-height",
+        type=int,
+        default=256,
+        help="Resize frames to this height before VAE encoding.",
+    )
+    parser.add_argument(
+        "--target-width",
+        type=int,
+        default=320,
+        help="Resize frames to this width before VAE encoding.",
     )
     parser.add_argument(
         "--max-sequence-length",
@@ -181,7 +194,7 @@ def iter_episode_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def read_video_segment(video_path: Path, start_frame: int, end_frame: int, stride: int) -> torch.Tensor:
+def read_video_segment(video_path: Path, start_frame: int, end_frame: int, stride: int, target_height: int, target_width: int) -> torch.Tensor:
     reader = imageio.get_reader(str(video_path))
     frames = []
     try:
@@ -200,6 +213,9 @@ def read_video_segment(video_path: Path, start_frame: int, end_frame: int, strid
             f"No frames sampled from {video_path} with range [{start_frame}, {end_frame}) and stride={stride}"
         )
     video = torch.stack(frames, dim=0).permute(3, 0, 1, 2).float() / 255.0
+    video = video.unsqueeze(0)
+    video = F.interpolate(video, size=(video.shape[2], target_height, target_width), mode='trilinear', align_corners=False)
+    video = video.squeeze(0)
     return video * 2.0 - 1.0
 
 
@@ -360,11 +376,9 @@ def main() -> None:
                 start_frame=job.start_frame,
                 end_frame=job.end_frame,
                 stride=frame_stride,
+                target_height=args.target_height,
+                target_width=args.target_width,
             ).unsqueeze(0)
-            if video.shape[-2] != info["features"][job.camera_key]["shape"][0] or video.shape[-1] != info["features"][job.camera_key]["shape"][1]:
-                raise ValueError(
-                    f"Unexpected frame size in {job.video_path}: {tuple(video.shape[-2:])}"
-                )
 
             video = video.to(device=device, dtype=torch_dtype)
             mu = vae.encode(video).latent_dist.mean
