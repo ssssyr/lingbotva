@@ -12,14 +12,8 @@ from functools import partial
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
+from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
-
-from .action_transforms import (
-    get_relative_pose,
-    get_relative_xyz_action,
-    map_binary_gripper_01_to_pm1,
-    to_numpy_array,
-)
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -53,18 +47,25 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-
-    if len(repo_list) == 0:
-        return []
-
-    num_init_worker = max(1, min(num_init_worker, len(repo_list)))
-    if num_init_worker == 1:
-        return [construct_func(repo_id) for repo_id in repo_list]
-
     with Pool(num_init_worker) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
                 
     return datasets_out_lst
+
+def get_relative_pose(pose):
+    if torch.is_tensor(pose):
+        pose = pose.detach().cpu().numpy()
+    
+    rot = R.from_quat(pose[:, 3:7])
+    first_rot = R.from_quat(np.tile(pose[:1, 3:7], (pose.shape[0], 1)))
+    trans = pose[:, :3]
+    relative_trans = trans - trans[0:1]
+
+    relative_rot = first_rot.inv() * rot
+    relative_quat = relative_rot.as_quat()
+
+    relative_pose = np.concatenate([relative_trans, relative_quat], axis=1)
+    return torch.from_numpy(relative_pose)
 
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
@@ -156,9 +157,6 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def parse_meta(self):
         out = []
-        max_bucket_key = getattr(self.config, "max_bucket_key", None)
-        if max_bucket_key is not None:
-            max_bucket_key = int(max_bucket_key)
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
@@ -169,11 +167,6 @@ class LatentLeRobotDataset(LeRobotDataset):
                     "tasks": tasks,
                 }
                 cur_meta.update(acfg)
-
-                if max_bucket_key is not None:
-                    segment_length = int(cur_meta["end_frame"]) - int(cur_meta["start_frame"])
-                    if segment_length > max_bucket_key:
-                        continue
 
                 check_statu = self._check_meta(
                     cur_meta["start_frame"],
@@ -263,32 +256,11 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
-        action = to_numpy_array(action[act_shift:])
-        if self.config.env_type == 'robotwin_tshape':
+        action = action[act_shift:]
+        if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        elif self.config.env_type == "none":
-            action = map_binary_gripper_01_to_pm1(action)
-            if getattr(self.config, "action_representation", "absolute") == "relative_chunk_anchor":
-                relative_action_base = getattr(
-                    self.config, "relative_action_base", "chunk_anchor"
-                )
-                if relative_action_base != "chunk_anchor":
-                    raise ValueError(
-                        "UR10 relative action processing only supports "
-                        f"relative_action_base='chunk_anchor', got {relative_action_base!r}"
-                    )
-                action = get_relative_xyz_action(action)
-            action_source_indices = getattr(self.config, "action_source_indices", None)
-            if action_source_indices is not None:
-                action_source_indices = list(action_source_indices)
-                if len(action_source_indices) != len(self.config.used_action_channel_ids):
-                    raise ValueError(
-                        "action_source_indices must match used_action_channel_ids length: "
-                        f"{len(action_source_indices)} vs {len(self.config.used_action_channel_ids)}"
-                    )
-                action = action[:, action_source_indices]
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1

@@ -1,9 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
-import re
 import sys
-import time
 from pathlib import Path
 import wandb
 
@@ -87,6 +85,7 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
+            attn_mode="flex"
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -118,26 +117,9 @@ class Trainer:
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
-        if hasattr(config, 'resume_from') and config.resume_from:
-            resume_step = self._infer_resume_step(config.resume_from)
-            self.step = resume_step
-            if resume_step > 0:
-                for _ in range(resume_step):
-                    self.lr_scheduler.step()
-            if self.config.rank == 0:
-                logger.info(f"Resuming step counter from step {self.step}")
-
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        init_workers = getattr(
-            config,
-            'init_worker',
-            int(os.environ.get('LINGBOT_VA_INIT_WORKERS', '8'))
-        )
-        train_dataset = MultiLatentLeRobotDataset(
-            config=config,
-            num_init_worker=init_workers,
-        )
+        train_dataset = MultiLatentLeRobotDataset(config=config)
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -166,14 +148,6 @@ class Trainer:
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     
-
-    def _infer_resume_step(self, checkpoint_path):
-        checkpoint_dir = Path(checkpoint_path)
-        match = re.search(r"checkpoint_step_(\d+)", checkpoint_dir.as_posix())
-        if match:
-            return int(match.group(1))
-        return 0
-
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
         if self.train_loader_iter is None:
@@ -326,28 +300,17 @@ class Trainer:
         input_dict = self._prepare_input_dict(batch)
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        rank = getattr(self.config, 'rank', -1)
-        logger.info(
-            f"microstep_enter rank={rank} step={self.step} microstep={batch_idx} should_sync={should_sync} "
-            f"latents_shape={tuple(batch['latents'].shape)} actions_shape={tuple(batch['actions'].shape)} "
-            f"actions_mask_shape={tuple(batch['actions_mask'].shape)}"
-        )
         
-        if hasattr(self.transformer, 'set_requires_gradient_sync'):
-            self.transformer.set_requires_gradient_sync(should_sync)
+        if not should_sync:
+            self.transformer.set_requires_gradient_sync(False)
+        else:
+            self.transformer.set_requires_gradient_sync(True)
 
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
         loss = latent_loss + action_loss
-        logger.info(
-            f"microstep_pre_backward rank={rank} step={self.step} microstep={batch_idx} should_sync={should_sync} "
-            f"latent_loss={latent_loss.detach().float().item():.4f} action_loss={action_loss.detach().float().item():.4f}"
-        )
 
         loss.backward()
-        logger.info(
-            f"microstep_post_backward rank={rank} step={self.step} microstep={batch_idx} should_sync={should_sync}"
-        )
 
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
         
@@ -474,7 +437,6 @@ class Trainer:
         accumulated_latent_losses = []
         accumulated_action_losses = []
         step_in_accumulation = 0
-        step_start_time = time.perf_counter()
 
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
@@ -507,8 +469,6 @@ class Trainer:
                     torch.cuda.empty_cache()
                     gc.collect()
 
-                step_time_s = time.perf_counter() - step_start_time
-
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
                     progress_bar.n += 1
@@ -517,14 +477,8 @@ class Trainer:
                         'action_loss': f'{action_loss_show:.4f}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
-                        'lr': f'{lr:.2e}',
-                        'step_time_s': f'{step_time_s:.2f}'
+                        'lr': f'{lr:.2e}'
                     })
-                    logger.info(
-                        f"train_step step={self.step} latent_loss={latent_loss_show:.4f} "
-                        f"action_loss={action_loss_show:.4f} grad_norm={total_norm.item():.2f} "
-                        f"lr={lr:.2e} step_time_s={step_time_s:.2f}"
-                    )
                     if self.config.enable_wandb:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
@@ -536,7 +490,6 @@ class Trainer:
                         }, step=self.step)
                 
                 self.step += 1
-                step_start_time = time.perf_counter()
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:

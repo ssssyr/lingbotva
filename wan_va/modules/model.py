@@ -1,7 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import math
-import os
-import time
 from copy import deepcopy
 
 import torch
@@ -17,173 +15,35 @@ from diffusers.models.embeddings import (
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
-from typing import Any, Callable, ClassVar
-try:
-    from torch.nn.attention.flex_attention import (
-        BlockMask,
-        create_block_mask,
-        flex_attention,
-        and_masks,
-        or_masks,
-    )
-    FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    BlockMask = Any
-    create_block_mask = None
-    flex_attention = None
-    and_masks = None
-    or_masks = None
-    FLEX_ATTENTION_AVAILABLE = False
+from typing import Callable, ClassVar
+from torch.nn.attention.flex_attention import (
+    _mask_mod_signature,
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+    and_masks,
+    or_masks
+)
 from functools import partial
 
-flash_attn_func = None
 try:
-    from flash_attn_interface import flash_attn_func as _flash_attn_func
-    flash_attn_func = _flash_attn_func
-except Exception:
-    try:
-        from flash_attn import flash_attn_func as _flash_attn_func
-        flash_attn_func = _flash_attn_func
-    except Exception:
-        flash_attn_func = None
+    from flash_attn_interface import flash_attn_func
+except:
+    from flash_attn import flash_attn_func
 
 __all__ = ['WanTransformer3DModel']
 
 
-def _debug_first_step_enabled():
-    return os.environ.get("LINGBOT_VA_DEBUG_FIRST_STEP", "0") == "1" and os.environ.get("RANK", "0") == "0"
-
-
-def _debug_first_step_log(message):
-    print(f"[first-step-debug] {message}", flush=True)
-
-
-def custom_sdpa(q, k, v, attn_mask=None):
-    if attn_mask is not None and attn_mask.dim() == 3:
-        attn_mask = attn_mask.unsqueeze(1)
+def custom_sdpa(q, k, v):
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
-                                         v.transpose(1, 2),
-                                         attn_mask=attn_mask)
+                                         v.transpose(1, 2))
     return out.transpose(1, 2)
 
-
-def _build_joint_token_metadata(
-    latent_shape,
-    action_shape,
-    padded_length,
-    chunk_size,
-    patch_size,
-):
-    B, _, L_F, L_H, L_W = latent_shape
-    _, _, A_F, A_H, A_W = action_shape
-
-    latent_seq_id = torch.arange(B)[:, None, None, None].expand(
-        -1,
-        L_F // patch_size[0],
-        L_H // patch_size[1],
-        L_W // patch_size[2],
-    ).flatten()
-    action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-    seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
-
-    latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(
-        B,
-        -1,
-        L_H // patch_size[1],
-        L_W // patch_size[2],
-    )[None].flatten()
-    action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-    frame_ids = torch.cat(
-        [latent_frame_id // chunk_size * 2] * 2 +
-        [action_frame_id // chunk_size * 2 + 1] * 2
-    )
-
-    noise_ids = torch.cat(
-        [
-            torch.zeros_like(latent_frame_id),
-            torch.ones_like(latent_frame_id),
-            torch.zeros_like(action_frame_id),
-            torch.ones_like(action_frame_id),
-        ]
-    )
-
-    seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
-    frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
-    noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
-    return seq_ids.long(), frame_ids.long(), noise_ids.long()
-
-
-def _build_text_seq_ids(batch_size, text_tokens_per_sample):
-    return torch.arange(batch_size)[:, None].expand(-1, text_tokens_per_sample).flatten().long()
-
-
-class DenseAttnMaskBuilder:
-    @staticmethod
-    @torch.no_grad()
-    def build_masks(
-        latent_shape,
-        action_shape,
-        padded_length,
-        chunk_size,
-        window_size,
-        patch_size,
-        batch_size,
-        text_tokens_per_sample,
-        device,
-    ):
-        seq_ids, frame_ids, noise_ids = _build_joint_token_metadata(
-            latent_shape,
-            action_shape,
-            padded_length,
-            chunk_size,
-            patch_size,
-        )
-        seq_ids = seq_ids.to(device)
-        frame_ids = frame_ids.to(device)
-        noise_ids = noise_ids.to(device)
-        text_seq_ids = _build_text_seq_ids(batch_size, text_tokens_per_sample).to(device)
-
-        q_seq = seq_ids[:, None]
-        kv_seq = seq_ids[None, :]
-        q_frame = frame_ids[:, None]
-        kv_frame = frame_ids[None, :]
-        q_noise = noise_ids[:, None]
-        kv_noise = noise_ids[None, :]
-
-        seq_mask = (q_seq == kv_seq) & (q_seq >= 0) & (kv_seq >= 0)
-        clean2clean_mask = (q_noise == 1) & (kv_noise == 1) & (kv_frame <= q_frame)
-        noise2clean_mask = (q_noise == 0) & (kv_noise == 1) & (kv_frame < q_frame)
-        noise2noise_mask = (q_noise == 0) & (kv_noise == 0) & (kv_frame == q_frame)
-        window_mask = (q_frame - kv_frame).abs() <= window_size
-
-        self_attn_mask = (
-            (clean2clean_mask | noise2clean_mask | noise2noise_mask)
-            & seq_mask
-            & window_mask
-        )
-        cross_attn_mask = (
-            (seq_ids[:, None] == text_seq_ids[None, :])
-            & (seq_ids[:, None] >= 0)
-        )
-
-        return self_attn_mask.unsqueeze(0).unsqueeze(0), cross_attn_mask.unsqueeze(0).unsqueeze(0)
-
 class FlexAttnFunc(nn.Module):
-    _disable_compile: ClassVar[bool] = os.environ.get(
-        "LINGBOT_VA_DISABLE_FLEX_COMPILE",
-        "0",
-    ) == "1"
-    if not FLEX_ATTENTION_AVAILABLE:
-        flex_attn: ClassVar[Callable | None] = None
-        compiled_create_block_mask: ClassVar[Callable | None] = None
-    elif _disable_compile:
-        flex_attn: ClassVar[Callable] = flex_attention
-        compiled_create_block_mask: ClassVar[Callable] = create_block_mask
-    else:
-        flex_attn: ClassVar[Callable] = torch.compile(
-            flex_attention, dynamic=True,
-        )
-        compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
+    flex_attn: ClassVar[Callable] = torch.compile(
+        flex_attention, dynamic=True, 
+    )
+    compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
 
@@ -192,11 +52,6 @@ class FlexAttnFunc(nn.Module):
         is_cross=False,
     ) -> None:
         super().__init__()
-        if not FLEX_ATTENTION_AVAILABLE:
-            raise ImportError(
-                "attn_mode='flex' requires torch.nn.attention.flex_attention. "
-                "Use attn_mode='torch' for the dense-mask fallback on older PyTorch builds."
-            )
         self.is_cross = is_cross
     
     def forward(
@@ -247,13 +102,30 @@ class FlexAttnFunc(nn.Module):
         device,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
-        seq_ids, frame_ids, noise_ids = _build_joint_token_metadata(
-            latent_shape,
-            action_shape,
-            padded_length,
-            chunk_size,
-            patch_size,
+        B, _, L_F, L_H, L_W = latent_shape
+        _, _, A_F, A_H, A_W = action_shape
+
+        latent_seq_id = torch.arange(B)[:, None, None, None].\
+            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
+        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
+        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
+
+        latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
+        action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
+        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+
+        noise_ids = torch.cat(
+            [
+                torch.zeros_like(latent_frame_id),
+                torch.ones_like(latent_frame_id),
+                torch.zeros_like(action_frame_id),
+                torch.ones_like(action_frame_id),
+            ]
         )
+
+        seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
+        frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
+        noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
 
         mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
         block_mask = FlexAttnFunc.compiled_create_block_mask(
@@ -261,7 +133,7 @@ class FlexAttnFunc(nn.Module):
             )
         FlexAttnFunc.attention_mask = block_mask
 
-        text_seq_ids = _build_text_seq_ids(latent_shape[0], 512)
+        text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
         mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
         block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
@@ -427,22 +299,15 @@ class WanAttention(torch.nn.Module):
         attn_mode='torch',
     ):
         super().__init__()
-        attn_mode = os.environ.get("LINGBOT_VA_FORCE_ATTN_MODE", attn_mode)
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
-            if flash_attn_func is None:
-                raise ImportError(
-                    "attn_mode='flashattn' requires flash-attn. "
-                    "Install via `pip install flash-attn --no-build-isolation` "
-                    "or switch attn_mode to 'torch'."
-                )
             self.attn_op = flash_attn_func
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)
         else:
             raise ValueError(
-                f"Unsupported attention mode: {attn_mode}, only support torch, flashattn and flex"
+                f"Unsupported attention mode: {attn_mode}, only support torch and flashattn"
             )
 
         self.inner_dim = dim_head * heads
@@ -552,7 +417,6 @@ class WanAttention(torch.nn.Module):
         k,
         v,
         rotary_emb,
-        attn_mask=None,
         update_cache=0,
         cache_name='pos',
     ):
@@ -588,16 +452,7 @@ class WanAttention(torch.nn.Module):
             key = key_pool[:, valid]
             value = value_pool[:, valid]
 
-        if attn_mask is not None:
-            if self.attn_op is custom_sdpa:
-                hidden_states = self.attn_op(query, key, value, attn_mask=attn_mask)
-            else:
-                raise ValueError(
-                    "Dense training masks are only implemented for attn_mode='torch'. "
-                    "Use attn_mode='torch' or 'flex' for training."
-                )
-        else:
-            hidden_states = self.attn_op(query, key, value)
+        hidden_states = self.attn_op(query, key, value)
 
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
@@ -608,28 +463,6 @@ class WanAttention(torch.nn.Module):
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
         return hidden_states
-
-
-class ResidualAdapter(nn.Module):
-
-    def __init__(self, dim, bottleneck_dim, eps=1e-6, dropout=0.0):
-        super().__init__()
-        self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.down = nn.Linear(dim, bottleneck_dim)
-        self.act = nn.SiLU()
-        self.drop = nn.Dropout(dropout)
-        self.up = nn.Linear(bottleneck_dim, dim)
-        # Keep the adapter branch as a no-op at init via zero-initialized `up`,
-        # while preserving gradients into the adapter on the first step.
-        self.alpha = nn.Parameter(torch.ones(1))
-
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.up.bias)
-
-    def forward(self, hidden_states):
-        norm_hidden_states = self.norm(hidden_states.float()).to(dtype=self.down.weight.dtype)
-        residual = self.up(self.drop(self.act(self.down(norm_hidden_states))))
-        return (hidden_states.float() + self.alpha * residual.float()).type_as(hidden_states)
 
 
 class WanTransformerBlock(nn.Module):
@@ -644,7 +477,6 @@ class WanTransformerBlock(nn.Module):
         attn_mode: str = "flashattn",
     ):
         super().__init__()
-        attn_mode = os.environ.get("LINGBOT_VA_FORCE_ATTN_MODE", attn_mode)
         self.attn_mode = attn_mode
 
         # 1. Self-attention
@@ -686,8 +518,6 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states,
         temb,
         rotary_emb,
-        self_attn_mask=None,
-        cross_attn_mask=None,
         update_cache=0,
         cache_name='pos',
     ) -> torch.Tensor:
@@ -708,7 +538,6 @@ class WanTransformerBlock(nn.Module):
                                  norm_hidden_states,
                                  norm_hidden_states,
                                  rotary_emb,
-                                 attn_mask=self_attn_mask,
                                  update_cache=update_cache,
                                  cache_name=cache_name)
         hidden_states = (hidden_states.float() +
@@ -721,7 +550,6 @@ class WanTransformerBlock(nn.Module):
                                  encoder_hidden_states,
                                  encoder_hidden_states,
                                  None,
-                                 attn_mask=cross_attn_mask,
                                  update_cache=0,
                                  cache_name=cache_name)
         hidden_states = hidden_states + attn_output
@@ -782,10 +610,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  eps=1e-06,
                  rope_max_seq_len=1024,
                  pos_embed_seq_len=None,
-                 attn_mode="torch",
-                 enable_action_residual_adapter=False,
-                 action_adapter_dim=256,
-                 action_adapter_dropout=0.0):
+                 attn_mode="torch"):
         r"""
         TODO
         """
@@ -808,10 +633,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             pos_embed_seq_len=pos_embed_seq_len,
         )
         self.condition_embedder_action = deepcopy(self.condition_embedder)
-        # The action branch only reuses the time embedder path.
-        # Freezing the duplicated text embedder avoids DDP unused-parameter
-        # overhead without changing the forward pass.
-        self.condition_embedder_action.text_embedder.requires_grad_(False)
 
         self.blocks = nn.ModuleList([
             WanTransformerBlock(inner_dim,
@@ -821,20 +642,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 eps,
                                 attn_mode=attn_mode) for _ in range(num_layers)
         ])
-
-        self.enable_action_residual_adapter = enable_action_residual_adapter
-        if self.enable_action_residual_adapter:
-            self.action_residual_adapters = nn.ModuleList([
-                ResidualAdapter(
-                    inner_dim,
-                    action_adapter_dim,
-                    eps=eps,
-                    dropout=action_adapter_dropout,
-                )
-                for _ in range(num_layers)
-            ])
-        else:
-            self.action_residual_adapters = None
 
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim,
@@ -892,36 +699,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
         return temb, timestep_proj
 
-    def _apply_action_adapter_train(self, hidden_states, split_list, block_idx):
-        if self.action_residual_adapters is None:
-            return hidden_states
-
-        latent_hidden_states, condition_latent_hidden_states, action_hidden_states, condition_action_hidden_states, pad_states = \
-            torch.split(hidden_states, split_list, dim=1)
-
-        action_hidden_states = self.action_residual_adapters[block_idx](action_hidden_states)
-
-        return torch.cat(
-            [
-                latent_hidden_states,
-                condition_latent_hidden_states,
-                action_hidden_states,
-                condition_action_hidden_states,
-                pad_states,
-            ],
-            dim=1,
-        )
-
-    def _apply_action_adapter_infer(self, hidden_states, block_idx, action_mode):
-        if (self.action_residual_adapters is None) or (not action_mode):
-            return hidden_states
-        return self.action_residual_adapters[block_idx](hidden_states)
-
     def forward_train(self, input_dict):
-        debug_first_step = _debug_first_step_enabled() and not getattr(
-            self, "_debug_first_step_done", False
-        )
-        debug_t0 = time.perf_counter()
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
@@ -944,10 +722,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                    condition_latent_hidden_states,
                                    action_hidden_states, 
                                    condition_action_hidden_states], dim=1)
-        if debug_first_step:
-            _debug_first_step_log(
-                f"input_embed_done elapsed={time.perf_counter() - debug_t0:.2f}s hidden={tuple(hidden_states.shape)}"
-            )
 
 
         latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
@@ -981,10 +755,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
         temb = F.pad(temb, (0, 0, 0, padded_length))
         timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
-        if debug_first_step:
-            _debug_first_step_log(
-                f"time_embed_done elapsed={time.perf_counter() - debug_t0:.2f}s padded_length={padded_length}"
-            )
 
         split_list = [latent_hidden_states.shape[1], 
                       condition_latent_hidden_states.shape[1], 
@@ -992,56 +762,21 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        self_attn_mask = None
-        cross_attn_mask = None
-        use_flex_attn = isinstance(self.blocks[0].attn1.attn_op, FlexAttnFunc)
-        if use_flex_attn:
-            mask_t0 = time.perf_counter()
-            FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                                   action_dict['noisy_latents'].shape, 
-                                   padded_length, 
-                                   input_dict["chunk_size"],
-                                   window_size=input_dict['window_size'],
-                                   patch_size=self.patch_size,
-                                   device=hidden_states.device
-                                   )
-            if debug_first_step:
-                _debug_first_step_log(
-                    f"init_mask_done elapsed={time.perf_counter() - mask_t0:.2f}s total={time.perf_counter() - debug_t0:.2f}s"
-                )
-        elif self.blocks[0].attn_mode == 'torch':
-            text_tokens_per_sample = text_hidden_states.shape[1] // batch_size
-            self_attn_mask, cross_attn_mask = DenseAttnMaskBuilder.build_masks(
-                latent_dict['noisy_latents'].shape,
-                action_dict['noisy_latents'].shape,
-                padded_length,
-                input_dict["chunk_size"],
-                input_dict['window_size'],
-                self.patch_size,
-                batch_size,
-                text_tokens_per_sample,
-                hidden_states.device,
-            )
-        else:
-            raise ValueError(
-                "train_mode without flex attention is only supported with attn_mode='torch'. "
-                f"Current attn_mode is {self.blocks[0].attn_mode!r}."
-            )
+        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
+                               action_dict['noisy_latents'].shape, 
+                               padded_length, 
+                               input_dict["chunk_size"],
+                               window_size=input_dict['window_size'],
+                               patch_size=self.patch_size,
+                               device=hidden_states.device
+                               )
 
-        block_t0 = time.perf_counter()
-        for block_idx, block in enumerate(self.blocks):
+        for block in self.blocks:
             hidden_states = block(hidden_states,
-                                  text_hidden_states,
-                                  timestep_proj,
-                                  rotary_emb,
-                                  self_attn_mask=self_attn_mask,
-                                  cross_attn_mask=cross_attn_mask,
-                                  update_cache=False)
-            hidden_states = self._apply_action_adapter_train(hidden_states, split_list, block_idx)
-            if debug_first_step and block_idx in {0, 9, 19, len(self.blocks) - 1}:
-                _debug_first_step_log(
-                    f"block_{block_idx}_done elapsed={time.perf_counter() - block_t0:.2f}s total={time.perf_counter() - debug_t0:.2f}s"
-                )
+                                         text_hidden_states,
+                                         timestep_proj,
+                                         rotary_emb,
+                                         update_cache=False)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -1059,11 +794,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_hidden_states = rearrange(action_hidden_states,
                                              '1 (b l) c -> b l c',
                                              b=batch_size)  #
-        if debug_first_step:
-            _debug_first_step_log(
-                f"forward_train_done total={time.perf_counter() - debug_t0:.2f}s"
-            )
-            self._debug_first_step_done = True
 
         return latent_hidden_states, action_hidden_states
 
@@ -1074,7 +804,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
-        return_video_features=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1090,15 +819,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
-            return_video_features (bool, *optional*, defaults to False):
-                If True, returns (latent_hidden_states, video_pooled) where video_pooled
-                is the mean-pooled video features [B, C] for HazardScheduler.
-                Only applies when action_mode=False.
 
         Returns:
-            Tensor or Tuple[Tensor, Tensor]:
-                If return_video_features=False: latent_hidden_states
-                If return_video_features=True: (latent_hidden_states, video_pooled)
+            List[Tensor]:
+                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
         if train_mode:
             return self.forward_train(input_dict)
@@ -1133,18 +857,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
-        for block_idx, block in enumerate(self.blocks):
+        for block in self.blocks:
             latent_hidden_states = block(latent_hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
                                          rotary_emb,
                                          update_cache=update_cache,
                                          cache_name=cache_name)
-            latent_hidden_states = self._apply_action_adapter_infer(
-                latent_hidden_states,
-                block_idx,
-                action_mode,
-            )
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -1154,11 +873,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 (1. + scale) +
                                 shift).type_as(latent_hidden_states)
 
-        # Save backbone features BEFORE proj_out for HazardScheduler
-        if return_video_features and not action_mode:
-            # Pool backbone hidden states: mean over spatial tokens
-            video_pooled = latent_hidden_states.mean(dim=1)  # [B, C]
-
         if action_mode:
             latent_hidden_states = self.action_proj_out(latent_hidden_states)
         else:
@@ -1166,10 +880,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_hidden_states = rearrange(latent_hidden_states,
                                              'b l (n c) -> b (l n) c',
                                              n=math.prod(self.patch_size))  #
-
-        # Return video features for HazardScheduler if requested
-        if return_video_features and not action_mode:
-            return latent_hidden_states, video_pooled
 
         return latent_hidden_states
 

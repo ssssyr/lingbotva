@@ -1,8 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
-import hashlib
 import os
-import re
 import sys
 import time
 from functools import partial
@@ -17,7 +15,7 @@ from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
@@ -38,8 +36,6 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
-from utils.hazard_loader import load_hazard_scheduler_head
-from modules.hazard_scheduler import HazardJumpScheduler, HazardJumpSchedulerHead, HazardScheduler
 
 
 class VA_Server:
@@ -61,7 +57,6 @@ class VA_Server:
             extra_one_step=True)
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
-        self.hazard_scheduler_head = None
 
         self.vae = load_vae(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -82,16 +77,15 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
-        transformer = load_transformer(
+        self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
             attn_mode="torch"
         )
-        self._init_hazard_runtime(transformer)
         shard_fn = shard_model
-        self.transformer = _configure_model(model=transformer,
+        self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
                                             device=self.device,
@@ -108,102 +102,6 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
-
-    def _init_hazard_runtime(self, transformer):
-        enabled = self._get_online_scheduler_mode() == "hazard"
-        checkpoint_path = str(getattr(self.job_config, "hazard_checkpoint_path", "") or "").strip()
-        if not enabled:
-            logger.info("Hazard runtime disabled; using fixed video inference steps.")
-            return
-        if not checkpoint_path:
-            raise ValueError(
-                "enable_hazard_scheduler_runtime=True requires hazard_checkpoint_path to be set."
-            )
-        scheduler_head, checkpoint = load_hazard_scheduler_head(
-            transformer=transformer,
-            config=self.job_config,
-            checkpoint_path=checkpoint_path,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        self.hazard_scheduler_head = scheduler_head
-        self.hazard_checkpoint_step = int(checkpoint.get("step", -1))
-        self.hazard_policy_variant = str(
-            checkpoint.get("policy_variant", getattr(self.job_config, "hazard_policy_variant", "stop_only_v1"))
-        ).lower()
-        logger.info(
-            "Hazard runtime enabled: checkpoint=%s step=%s variant=%s K_max=%s K_min=%s eta=%s feature_source=%s",
-            checkpoint_path,
-            self.hazard_checkpoint_step,
-            self.hazard_policy_variant,
-            getattr(self.job_config, "hazard_K_max", getattr(self.job_config, "num_inference_steps", None)),
-            getattr(self.job_config, "hazard_K_min", None),
-            getattr(self.job_config, "hazard_eta", None),
-            getattr(self.job_config, "hazard_feature_source", "cond"),
-        )
-
-    def _get_online_scheduler_mode(self):
-        raw_mode = getattr(self.job_config, "online_scheduler_mode", None)
-        if raw_mode is None:
-            raw_mode = "hazard" if bool(
-                getattr(self.job_config, "enable_hazard_scheduler_runtime", False)
-            ) else "fixed"
-        mode = str(raw_mode).strip().lower()
-        if mode not in {"fixed", "hazard"}:
-            raise ValueError(
-                f"Unsupported online_scheduler_mode={raw_mode!r}. Expected 'fixed' or 'hazard'."
-            )
-        return mode
-
-    def _get_fixed_video_steps(self):
-        configured_steps = getattr(self.job_config, "fixed_video_steps", None)
-        if configured_steps is None:
-            configured_steps = getattr(self.job_config, "video_exec_step", -1)
-            if int(configured_steps) == -1:
-                configured_steps = getattr(self.job_config, "num_inference_steps", 25)
-        fixed_steps = int(configured_steps)
-        if fixed_steps <= 0:
-            raise ValueError(f"fixed_video_steps must be positive, got {fixed_steps}")
-        return min(fixed_steps, int(self.job_config.num_inference_steps))
-
-    def _save_debug_artifacts_enabled(self):
-        return bool(getattr(self.job_config, "save_debug_artifacts", True))
-
-    def _maybe_save_async(self, tensor, path):
-        if self._save_debug_artifacts_enabled():
-            save_async(tensor, path)
-
-    def _sync_device(self):
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-
-    def get_server_metadata(self):
-        return {
-            "guidance_scale": float(getattr(self.job_config, "guidance_scale", 1.0)),
-            "action_guidance_scale": float(getattr(self.job_config, "action_guidance_scale", 1.0)),
-            "online_scheduler_mode": self._get_online_scheduler_mode(),
-            "fixed_video_steps": int(self._get_fixed_video_steps()),
-            "hazard_enabled": bool(self._get_online_scheduler_mode() == "hazard"),
-            "hazard_checkpoint_path": str(getattr(self.job_config, "hazard_checkpoint_path", "") or ""),
-            "hazard_eta": float(getattr(self.job_config, "hazard_eta", 0.5)),
-            "hazard_k_min": int(getattr(self.job_config, "hazard_K_min", 3)),
-            "hazard_k_max": int(getattr(self.job_config, "hazard_K_max", getattr(self.job_config, "num_inference_steps", 25))),
-            "hazard_feature_source": str(getattr(self.job_config, "hazard_feature_source", "cond")),
-            "save_debug_artifacts": bool(getattr(self.job_config, "save_debug_artifacts", True)),
-        }
-
-    def _build_safe_exp_name(self, prompt):
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        if not prompt:
-            return f"default_{timestamp}"
-
-        cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", prompt).strip("._-")
-        cleaned = re.sub(r"_+", "_", cleaned)
-        if not cleaned:
-            cleaned = "prompt"
-        prefix = cleaned[:64].rstrip("._-") or "prompt"
-        prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
-        return f"{prefix}_{prompt_hash}_{timestamp}"
 
     def _get_t5_prompt_embeds(
         self,
@@ -537,373 +435,12 @@ class VA_Server:
                 dtype=self.dtype,
             )
 
-        self.exp_name = self._build_safe_exp_name(prompt)
-        if self._save_debug_artifacts_enabled():
-            self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
-            os.makedirs(self.exp_save_root, exist_ok=True)
-        else:
-            self.exp_save_root = None
+        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+        self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
+        os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
-    def _get_latent_cond(self, frame_st_id):
-        if frame_st_id != 0 or self.init_latent is None:
-            return None
-        return self.init_latent[:, :, 0:1].to(self.dtype)
-
-    def _apply_video_cfg(self, video_noise_pred, frame_chunk_size):
-        video_noise_pred = data_seq_to_patch(
-            self.job_config.patch_size,
-            video_noise_pred,
-            frame_chunk_size,
-            self.latent_height,
-            self.latent_width,
-            batch_size=2 if self.use_cfg else 1,
-        )
-        if self.job_config.guidance_scale > 1:
-            video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (
-                video_noise_pred[:1] - video_noise_pred[1:]
-            )
-        else:
-            video_noise_pred = video_noise_pred[:1]
-        return video_noise_pred
-
-    def _apply_action_cfg(self, action_noise_pred, frame_chunk_size):
-        action_noise_pred = rearrange(
-            action_noise_pred,
-            'b (f n) c -> b c f n 1',
-            f=frame_chunk_size,
-        )
-        if self.job_config.action_guidance_scale > 1:
-            action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (
-                action_noise_pred[:1] - action_noise_pred[1:]
-            )
-        else:
-            action_noise_pred = action_noise_pred[:1]
-        return action_noise_pred
-
-    def _select_hazard_video_feature(self, video_pooled):
-        if not self.use_cfg or video_pooled.shape[0] == 1:
-            return video_pooled[:1]
-
-        feature_source = str(getattr(self.job_config, "hazard_feature_source", "cond")).lower()
-        if feature_source == "cond":
-            return video_pooled[:1]
-        if feature_source == "uncond":
-            return video_pooled[1:2]
-        if feature_source == "guided":
-            return video_pooled[1:2] + self.job_config.guidance_scale * (
-                video_pooled[:1] - video_pooled[1:2]
-            )
-        raise ValueError(
-            f"Unsupported hazard_feature_source={feature_source!r}. "
-            "Expected one of: cond, uncond, guided."
-        )
-
-    def _refresh_video_cache_exact(self, latents, refresh_t, frame_st_id=0):
-        latent_cond = self._get_latent_cond(frame_st_id)
-        input_dict = self._prepare_latent_input(
-            latents,
-            None,
-            refresh_t,
-            refresh_t,
-            latent_cond,
-            None,
-            frame_st_id=frame_st_id,
-        )
-        self.transformer(
-            self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-            update_cache=1,
-            cache_name=self.cache_name,
-            action_mode=False,
-        )
-
-    def _run_action_from_cache(self, actions, action_timesteps, frame_chunk_size, frame_st_id=0):
-        self._sync_device()
-        action_t0 = time.perf_counter()
-        for i, t in enumerate(tqdm(action_timesteps)):
-            last_step = i == len(action_timesteps) - 1
-            action_cond = torch.zeros(
-                [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
-                device=self.device,
-                dtype=self.dtype,
-            ) if frame_st_id == 0 else None
-
-            input_dict = self._prepare_latent_input(
-                None,
-                actions,
-                t,
-                t,
-                None,
-                action_cond,
-                frame_st_id=frame_st_id,
-            )
-            action_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                update_cache=1 if last_step else 0,
-                cache_name=self.cache_name,
-                action_mode=True,
-            )
-
-            if not last_step:
-                action_noise_pred = self._apply_action_cfg(action_noise_pred, frame_chunk_size)
-                actions = self.action_scheduler.step(
-                    action_noise_pred,
-                    t,
-                    actions,
-                    return_dict=False,
-                )
-
-            if action_cond is not None:
-                actions[:, :, 0:1] = action_cond
-        self._sync_device()
-        return actions, (time.perf_counter() - action_t0) * 1000.0
-
-    def _run_fixed_video_loop(self, latents, video_timesteps, padded_video_timesteps, frame_chunk_size, frame_st_id=0):
-        self._sync_device()
-        video_t0 = time.perf_counter()
-        fixed_steps = self._get_fixed_video_steps()
-        if int(getattr(self.job_config, "video_exec_step", -1)) != -1:
-            logger.warning(
-                "video_exec_step=%s is deprecated for online fixed scheduler mode; using fixed_video_steps=%s.",
-                self.job_config.video_exec_step,
-                fixed_steps,
-            )
-        latent_cond = self._get_latent_cond(frame_st_id)
-        for step_idx in range(fixed_steps):
-            t = video_timesteps[step_idx]
-            input_dict = self._prepare_latent_input(
-                latents,
-                None,
-                t,
-                t,
-                latent_cond,
-                None,
-                frame_st_id=frame_st_id,
-            )
-
-            video_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                update_cache=0,
-                cache_name=self.cache_name,
-                action_mode=False,
-            )
-
-            video_noise_pred = self._apply_video_cfg(video_noise_pred, frame_chunk_size)
-            latents = self.scheduler.step(
-                video_noise_pred,
-                t,
-                latents,
-                return_dict=False,
-            )
-
-            if latent_cond is not None:
-                latents[:, :, 0:1] = latent_cond
-
-        refresh_t = padded_video_timesteps[fixed_steps] if fixed_steps < len(padded_video_timesteps) else 0.0
-        self._refresh_video_cache_exact(latents, refresh_t, frame_st_id=frame_st_id)
-        self._sync_device()
-        scheduler_meta = {
-            "mode": "fixed",
-            "video_steps_used": int(fixed_steps),
-            "video_steps_max": int(self.job_config.num_inference_steps),
-            "fixed_video_steps": int(fixed_steps),
-            "video_runtime_ms": (time.perf_counter() - video_t0) * 1000.0,
-        }
-        return latents, scheduler_meta
-
-    def _run_hazard_video_loop(self, latents, video_timesteps, padded_video_timesteps, frame_chunk_size, frame_st_id=0):
-        if getattr(self, "hazard_policy_variant", "stop_only_v1") == "stop_jump_v2" or isinstance(self.hazard_scheduler_head, HazardJumpSchedulerHead):
-            return self._run_hazard_jump_video_loop(
-                latents,
-                video_timesteps,
-                padded_video_timesteps,
-                frame_chunk_size,
-                frame_st_id=frame_st_id,
-            )
-        self._sync_device()
-        video_t0 = time.perf_counter()
-        if self.hazard_scheduler_head is None:
-            raise RuntimeError("Hazard runtime is enabled but scheduler head is not loaded.")
-
-        if self.job_config.video_exec_step != -1:
-            logger.warning("Ignoring video_exec_step=%s because hazard runtime is enabled.", self.job_config.video_exec_step)
-
-        hazard_k_max = max(
-            1,
-            min(int(getattr(self.job_config, "hazard_K_max", len(video_timesteps))), len(video_timesteps)),
-        )
-        hazard_scheduler = HazardScheduler(
-            scheduler_head=self.hazard_scheduler_head,
-            K_max=hazard_k_max,
-            K_min=int(getattr(self.job_config, "hazard_K_min", 3)),
-            eta=float(getattr(self.job_config, "hazard_eta", 0.5)),
-            mode='eval',
-        )
-        latent_cond = self._get_latent_cond(frame_st_id)
-
-        for step_idx in range(hazard_k_max):
-            t = video_timesteps[step_idx]
-            input_dict = self._prepare_latent_input(
-                latents,
-                None,
-                t,
-                t,
-                latent_cond,
-                None,
-                frame_st_id=frame_st_id,
-            )
-            video_noise_pred, video_pooled = self.transformer(
-                self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                update_cache=0,
-                cache_name=self.cache_name,
-                action_mode=False,
-                return_video_features=True,
-            )
-            video_noise_pred = self._apply_video_cfg(video_noise_pred, frame_chunk_size)
-            latents = self.scheduler.step(
-                video_noise_pred,
-                t,
-                latents,
-                return_dict=False,
-            )
-            if latent_cond is not None:
-                latents[:, :, 0:1] = latent_cond
-
-            scheduler_result = hazard_scheduler.step(
-                self._select_hazard_video_feature(video_pooled).detach()
-            )
-            if scheduler_result["should_stop"]:
-                break
-
-        video_steps_used = int(hazard_scheduler.stop_step or hazard_k_max)
-        refresh_t = padded_video_timesteps[video_steps_used] if video_steps_used < len(padded_video_timesteps) else 0.0
-        self._refresh_video_cache_exact(latents, refresh_t, frame_st_id=frame_st_id)
-        self._sync_device()
-        scheduler_meta = {
-            "mode": "hazard",
-            "video_steps_used": video_steps_used,
-            "video_steps_max": int(self.job_config.num_inference_steps),
-            "video_steps_limit": int(hazard_k_max),
-            "hazard_eta": float(getattr(self.job_config, "hazard_eta", 0.5)),
-            "hazard_feature_source": str(getattr(self.job_config, "hazard_feature_source", "cond")),
-            "hazard_checkpoint_step": int(getattr(self, "hazard_checkpoint_step", -1)),
-            "hazard_h_cumulative": float(hazard_scheduler.H_cumulative),
-            "video_runtime_ms": (time.perf_counter() - video_t0) * 1000.0,
-        }
-        return latents, scheduler_meta
-
-    def _run_hazard_jump_video_loop(self, latents, video_timesteps, padded_video_timesteps, frame_chunk_size, frame_st_id=0):
-        self._sync_device()
-        video_t0 = time.perf_counter()
-        if self.hazard_scheduler_head is None:
-            raise RuntimeError("Hazard runtime is enabled but scheduler head is not loaded.")
-        if not isinstance(self.hazard_scheduler_head, HazardJumpSchedulerHead):
-            raise TypeError(
-                "stop_jump_v2 runtime requires HazardJumpSchedulerHead, "
-                f"got {type(self.hazard_scheduler_head).__name__}"
-            )
-
-        hazard_k_max = max(
-            1,
-            min(int(getattr(self.job_config, "hazard_K_max", len(video_timesteps))), len(video_timesteps)),
-        )
-        hazard_scheduler = HazardJumpScheduler(
-            scheduler_head=self.hazard_scheduler_head,
-            K_max=hazard_k_max,
-            K_min=int(getattr(self.job_config, "hazard_K_min", 3)),
-            eta=float(getattr(self.job_config, "hazard_eta", 0.5)),
-            sigma_min=float(getattr(self.job_config, "hazard_sigma_min", 0.01)),
-            jump_logprob_scale=float(getattr(self.job_config, "jump_logprob_scale", 1.0)),
-            mode='eval',
-        )
-        latent_cond = self._get_latent_cond(frame_st_id)
-        sigma_cur = float(self.scheduler.sigmas[0].item())
-        sigma_history = []
-        sigma_next_history = []
-        jump_ratio_history = []
-        jump_distance_history = []
-        video_steps_used = 0
-        decision_steps_used = 0
-
-        for _step_idx in range(hazard_k_max):
-            t = self.scheduler.sigma_to_timestep(sigma_cur).to(device=self.device, dtype=torch.float32)
-            input_dict = self._prepare_latent_input(
-                latents,
-                None,
-                t,
-                t,
-                latent_cond,
-                None,
-                frame_st_id=frame_st_id,
-            )
-            video_noise_pred, video_pooled = self.transformer(
-                self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                update_cache=0,
-                cache_name=self.cache_name,
-                action_mode=False,
-                return_video_features=True,
-            )
-            video_noise_pred = self._apply_video_cfg(video_noise_pred, frame_chunk_size)
-            scheduler_result = hazard_scheduler.step(
-                self._select_hazard_video_feature(video_pooled).detach(),
-                sigma_cur=sigma_cur,
-            )
-            decision_steps_used += 1
-            sigma_history.append(float(scheduler_result["sigma_cur"]))
-            sigma_next_history.append(
-                None if scheduler_result["sigma_next"] is None else float(scheduler_result["sigma_next"])
-            )
-            if scheduler_result["jump_ratio"] is not None:
-                jump_ratio_history.append(float(scheduler_result["jump_ratio"].mean().item()))
-                jump_distance_history.append(float(scheduler_result["jump_distance"].mean().item()))
-            else:
-                jump_ratio_history.append(None)
-                jump_distance_history.append(None)
-            if scheduler_result["should_stop"]:
-                break
-
-            sigma_next = float(scheduler_result["sigma_next"])
-            latents = self.scheduler.custom_step(
-                video_noise_pred,
-                sigma_cur=sigma_cur,
-                sigma_next=sigma_next,
-                sample=latents,
-                return_dict=False,
-            )
-            video_steps_used += 1
-            if latent_cond is not None:
-                latents[:, :, 0:1] = latent_cond
-            sigma_cur = sigma_next
-            if scheduler_result.get("forced_terminal", False):
-                break
-
-        terminal_sigma = float(sigma_cur)
-        refresh_t = self.scheduler.sigma_to_timestep(terminal_sigma)
-        self._refresh_video_cache_exact(latents, refresh_t, frame_st_id=frame_st_id)
-        self._sync_device()
-        scheduler_meta = {
-            "mode": "hazard_jump_v2",
-            "video_steps_used": int(video_steps_used),
-            "video_decision_steps_used": int(decision_steps_used),
-            "video_steps_max": int(self.job_config.num_inference_steps),
-            "video_steps_limit": int(hazard_k_max),
-            "equivalent_fixed_steps": int(self.scheduler.approx_step_index(terminal_sigma) + 1),
-            "terminal_sigma": terminal_sigma,
-            "sigma_history": sigma_history,
-            "sigma_next_history": sigma_next_history,
-            "jump_ratio_history": jump_ratio_history,
-            "jump_distance_history": jump_distance_history,
-            "hazard_eta": float(getattr(self.job_config, "hazard_eta", 0.5)),
-            "hazard_feature_source": str(getattr(self.job_config, "hazard_feature_source", "cond")),
-            "hazard_checkpoint_step": int(getattr(self, "hazard_checkpoint_step", -1)),
-            "hazard_h_cumulative": float(hazard_scheduler.H_cumulative),
-            "video_runtime_ms": (time.perf_counter() - video_t0) * 1000.0,
-        }
-        return latents, scheduler_meta
-
     def _infer(self, obs, frame_st_id=0):
-        self._sync_device()
-        infer_t0 = time.perf_counter()
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
@@ -930,68 +467,112 @@ class VA_Server:
 
         self.scheduler.set_timesteps(video_inference_step)
         self.action_scheduler.set_timesteps(action_inference_step)
-        video_timesteps = self.scheduler.timesteps
+        timesteps = self.scheduler.timesteps
         action_timesteps = self.action_scheduler.timesteps
 
-        padded_video_timesteps = F.pad(video_timesteps, (0, 1), mode='constant', value=0)
+        timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
 
         if video_step != -1:
-            padded_video_timesteps = padded_video_timesteps[:video_step]
+            timesteps = timesteps[:video_step]
 
         action_timesteps = F.pad(
             action_timesteps,
             (0,
-             1),
+             1),  # pad 1 element at the end (right side) of the last dimension
             mode='constant',
             value=0)
 
         with (
                 torch.no_grad(),
         ):
-            scheduler_mode = self._get_online_scheduler_mode()
-            if scheduler_mode == "hazard":
-                latents, scheduler_meta = self._run_hazard_video_loop(
+            # 1. Video Generation Loop
+            for i, t in enumerate(tqdm(timesteps)):
+                last_step = i == len(timesteps) - 1
+                latent_cond = init_latent[:, :, 0:1].to(
+                    self.dtype) if frame_st_id == 0 else None
+                input_dict = self._prepare_latent_input(
                     latents,
-                    video_timesteps,
-                    padded_video_timesteps,
-                    frame_chunk_size,
-                    frame_st_id=frame_st_id,
-                )
-            else:
-                latents, scheduler_meta = self._run_fixed_video_loop(
-                    latents,
-                    video_timesteps,
-                    padded_video_timesteps,
-                    frame_chunk_size,
-                    frame_st_id=frame_st_id,
-                )
+                    None,
+                    t,
+                    t,
+                    latent_cond,
+                    None,
+                    frame_st_id=frame_st_id)
 
-            actions, action_runtime_ms = self._run_action_from_cache(
-                actions,
-                action_timesteps,
-                frame_chunk_size,
-                frame_st_id=frame_st_id,
-            )
+                video_noise_pred = self.transformer(
+                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                    update_cache=1 if last_step else 0,
+                    cache_name=self.cache_name,
+                    action_mode=False)
+
+                if not last_step or video_step != -1:
+                    video_noise_pred = data_seq_to_patch(
+                        self.job_config.patch_size, video_noise_pred,
+                        frame_chunk_size, self.latent_height,
+                        self.latent_width, batch_size=2 if self.use_cfg else 1)
+                    if self.job_config.guidance_scale > 1:
+                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                    else:
+                        video_noise_pred = video_noise_pred[:1]
+                    latents = self.scheduler.step(video_noise_pred,
+                                                  t,
+                                                  latents,
+                                                  return_dict=False)
+
+                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+
+            for i, t in enumerate(tqdm(action_timesteps)):
+                last_step = i == len(action_timesteps) - 1
+                action_cond = torch.zeros(
+                    [
+                        1, self.job_config.action_dim, 1,
+                        self.action_per_frame, 1
+                    ],
+                    device=self.device,
+                    dtype=self.dtype) if frame_st_id == 0 else None
+
+                input_dict = self._prepare_latent_input(
+                    None,
+                    actions,
+                    t,
+                    t,
+                    None,
+                    action_cond,
+                    frame_st_id=frame_st_id)
+                action_noise_pred = self.transformer(
+                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                    update_cache=1 if last_step else 0,
+                    cache_name=self.cache_name,
+                    action_mode=True)
+
+                if not last_step:
+                    action_noise_pred = rearrange(action_noise_pred,
+                                                  'b (f n) c -> b c f n 1',
+                                                  f=frame_chunk_size)
+                    if self.job_config.action_guidance_scale > 1:
+                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                    else:
+                        action_noise_pred = action_noise_pred[:1]
+                    actions = self.action_scheduler.step(action_noise_pred,
+                                                         t,
+                                                         actions,
+                                                         return_dict=False)
+
+                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
 
-        if self.exp_save_root is not None:
-            self._maybe_save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-            self._maybe_save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
-        self._sync_device()
-        scheduler_meta["action_runtime_ms"] = action_runtime_ms
-        scheduler_meta["total_runtime_ms"] = (time.perf_counter() - infer_t0) * 1000.0
-        scheduler_meta["frame_st_id"] = int(frame_st_id)
         torch.cuda.empty_cache()
-        return actions, latents, scheduler_meta
+        return actions, latents
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        if self.exp_save_root is not None:
-            self._maybe_save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
@@ -1039,11 +620,8 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _, scheduler_meta = self._infer(obs, frame_st_id=getattr(self, "frame_st_id", 0))
-            response = dict(action=action)
-            if bool(getattr(self.job_config, "hazard_return_metadata", False)):
-                response["scheduler_meta"] = scheduler_meta
-            return response
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -1074,7 +652,7 @@ class VA_Server:
         pred_latent_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents, _ = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)
@@ -1102,32 +680,6 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
-    if args.guidance_scale is not None:
-        config.guidance_scale = float(args.guidance_scale)
-    if args.action_guidance_scale is not None:
-        config.action_guidance_scale = float(args.action_guidance_scale)
-    if args.online_scheduler_mode is not None:
-        config.online_scheduler_mode = args.online_scheduler_mode
-    if args.fixed_video_steps is not None:
-        config.fixed_video_steps = int(args.fixed_video_steps)
-    if args.enable_hazard_scheduler_runtime is not None:
-        config.enable_hazard_scheduler_runtime = bool(args.enable_hazard_scheduler_runtime)
-    if args.hazard_checkpoint is not None:
-        config.hazard_checkpoint_path = args.hazard_checkpoint
-    if args.hazard_eta is not None:
-        config.hazard_eta = float(args.hazard_eta)
-    if args.hazard_k_min is not None:
-        config.hazard_K_min = int(args.hazard_k_min)
-    if args.hazard_k_max is not None:
-        config.hazard_K_max = int(args.hazard_k_max)
-    if args.hazard_feature_source is not None:
-        config.hazard_feature_source = args.hazard_feature_source
-    if args.hazard_return_metadata is not None:
-        config.hazard_return_metadata = bool(args.hazard_return_metadata)
-    if args.save_debug_artifacts is not None:
-        config.save_debug_artifacts = bool(args.save_debug_artifacts)
-    if args.enable_offload is not None:
-        config.enable_offload = bool(args.enable_offload)
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1168,90 +720,6 @@ def main():
         type=str,
         default=None,
         help='save root'
-    )
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=None,
-        help='video CFG guidance scale override',
-    )
-    parser.add_argument(
-        "--action-guidance-scale",
-        type=float,
-        default=None,
-        help='action CFG guidance scale override',
-    )
-    parser.add_argument(
-        "--online-scheduler-mode",
-        type=str,
-        choices=["fixed", "hazard"],
-        default=None,
-        help='online scheduler mode: fixed steps or adaptive hazard scheduler',
-    )
-    parser.add_argument(
-        "--fixed-video-steps",
-        type=int,
-        default=None,
-        help='fixed number of video denoising steps for online fixed mode',
-    )
-    parser.add_argument(
-        "--enable-hazard-scheduler-runtime",
-        type=int,
-        choices=[0, 1],
-        default=None,
-        help='enable adaptive hazard scheduler online inference',
-    )
-    parser.add_argument(
-        "--hazard-checkpoint",
-        type=str,
-        default=None,
-        help='path to hazard scheduler checkpoint',
-    )
-    parser.add_argument(
-        "--hazard-eta",
-        type=float,
-        default=None,
-        help='deterministic hazard stop threshold',
-    )
-    parser.add_argument(
-        "--hazard-k-min",
-        type=int,
-        default=None,
-        help='minimum video denoising steps before hazard can stop',
-    )
-    parser.add_argument(
-        "--hazard-k-max",
-        type=int,
-        default=None,
-        help='maximum video denoising steps available to the hazard scheduler',
-    )
-    parser.add_argument(
-        "--hazard-feature-source",
-        type=str,
-        choices=["cond", "uncond", "guided"],
-        default=None,
-        help='which CFG branch feature to feed into the hazard scheduler',
-    )
-    parser.add_argument(
-        "--hazard-return-metadata",
-        type=int,
-        choices=[0, 1],
-        default=None,
-        help='whether the server returns scheduler metadata with each action chunk',
-    )
-    parser.add_argument(
-        "--save-debug-artifacts",
-        type=int,
-        choices=[0, 1],
-        default=None,
-        help='whether to save per-chunk latents/actions/obs debug artifacts',
-    )
-    parser.add_argument(
-        "--enable-offload",
-        type=int,
-        choices=[0, 1],
-        default=None,
-        help='whether to offload VAE/text encoder auxiliary modules to CPU',
     )
     args = parser.parse_args()
     run(args)

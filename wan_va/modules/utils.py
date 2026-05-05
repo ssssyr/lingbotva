@@ -26,25 +26,10 @@ def load_text_encoder(
     torch_dtype,
     torch_device,
 ):
-    text_encoder, loading_info = UMT5EncoderModel.from_pretrained(
+    text_encoder = UMT5EncoderModel.from_pretrained(
         text_encoder_path,
         torch_dtype=torch_dtype,
-        output_loading_info=True,
     )
-
-    # Some Wan checkpoints only ship `shared.weight`. In that case, make the
-    # encoder input embedding explicitly reuse the shared table instead of
-    # keeping a freshly initialized random `encoder.embed_tokens`.
-    missing_keys = set(loading_info.get("missing_keys", [])) if isinstance(loading_info, dict) else set()
-    if "encoder.embed_tokens.weight" in missing_keys:
-        text_encoder.set_input_embeddings(text_encoder.get_input_embeddings())
-
-    shared = getattr(text_encoder, "shared", None)
-    encoder = getattr(text_encoder, "encoder", None)
-    embed_tokens = getattr(encoder, "embed_tokens", None)
-    if shared is not None and embed_tokens is not shared:
-        text_encoder.set_input_embeddings(shared)
-
     return text_encoder.to(torch_device)
 
 

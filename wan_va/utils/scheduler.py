@@ -88,38 +88,6 @@ class FlowMatchScheduler():
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
 
-    def sigma_to_timestep(self, sigma):
-        if not torch.is_tensor(sigma):
-            sigma = torch.tensor(float(sigma), dtype=torch.float32)
-        return sigma.to(dtype=torch.float32) * float(self.num_train_timesteps)
-
-    def timestep_to_sigma(self, timestep):
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor(float(timestep), dtype=torch.float32)
-        return timestep.to(dtype=torch.float32) / float(self.num_train_timesteps)
-
-    def approx_step_index(self, sigma):
-        if not torch.is_tensor(sigma):
-            sigma = torch.tensor(float(sigma), dtype=torch.float32)
-        sigma_value = sigma.detach().float().cpu()
-        return int(torch.argmin((self.sigmas.float() - sigma_value).abs()).item())
-
-    def custom_step(self, model_output, sigma_cur, sigma_next, sample, return_dict=False):
-        if not torch.is_tensor(sigma_cur):
-            sigma_cur = torch.tensor(float(sigma_cur), dtype=torch.float32, device=sample.device)
-        if not torch.is_tensor(sigma_next):
-            sigma_next = torch.tensor(float(sigma_next), dtype=torch.float32, device=sample.device)
-        sigma_cur = sigma_cur.to(device=sample.device, dtype=torch.float32)
-        sigma_next = sigma_next.to(device=sample.device, dtype=torch.float32)
-        delta_sigma = (sigma_next - sigma_cur)
-        while delta_sigma.ndim < sample.ndim:
-            delta_sigma = delta_sigma.unsqueeze(-1)
-        prev_sample = sample.to(torch.float32) + model_output.to(torch.float32) * delta_sigma
-        prev_sample = prev_sample.to(dtype=model_output.dtype)
-        if return_dict:
-            return {"prev_sample": prev_sample}
-        return prev_sample
-
     def return_to_timestep(self, timestep, sample, sample_stablized):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
